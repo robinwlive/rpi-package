@@ -278,16 +278,15 @@ pub fn start_supervisor() -> bool {
     let Some(exe) = supervisor_executable() else {
         return false;
     };
-    std::process::Command::new(exe)
+    let spawned = std::process::Command::new(&exe)
         .env("RPI_CODING_AGENT_SESSION_DIR", &session_dir)
         // The supervisor has no terminal: its output is discarded so a
         // caller reading this process's pipes is not held open by it.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| true)
-        .unwrap_or(false)
+        .spawn();
+    spawned.is_ok()
 }
 
 /// The supervisor binary.

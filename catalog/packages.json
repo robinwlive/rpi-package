@@ -44,6 +44,17 @@
     "prebuilt_manifest": "https://github.com/pi-rust/rpi-package/releases/download/rpi-orchestrator-v0.1.12/rpi-extension.json"
   },
   {
+    "name": "rpi-superagent",
+    "version": "0.1.12",
+    "type": "extension",
+    "tool": "superagent_plan + superagent_dispatch + superagent_delegate + superagent_task",
+    "inspiredBy": "Long tasks that survive a restart",
+    "sourceDownloadsPerMonth": null,
+    "install": "rpi install rpi-superagent",
+    "repository": "https://github.com/pi-rust/rpi-package",
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-package/releases/download/rpi-superagent-v0.1.12/rpi-extension.json"
+  },
+  {
     "name": "rpi-btw",
     "version": "0.1.0",
     "type": "extension",

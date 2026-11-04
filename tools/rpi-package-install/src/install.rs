@@ -130,6 +130,21 @@ pub fn plan(extensions: &[Extension], source_dir: &Path, target_dir: &Path) -> R
             dest: target_dir.join(ext.file_name()),
             package: ext.package.clone(),
         });
+        // Files that ship with the extension: a helper binary the extension
+        // starts on its own. They install beside the library, because that is
+        // where the extension looks for them.
+        for extra in &ext.extras {
+            let source = source_dir.join(extra.file_name());
+            if !source.is_file() {
+                missing.push(source.display().to_string());
+                continue;
+            }
+            actions.push(Action {
+                source,
+                dest: target_dir.join(extra.file_name()),
+                package: ext.package.clone(),
+            });
+        }
     }
     if !missing.is_empty() {
         bail!(
@@ -181,6 +196,7 @@ pub fn run(opts: &Options) -> Result<Vec<PathBuf>> {
                     Some(Extension {
                         package: artifact.clone(),
                         artifact,
+                        extras: Vec::new(),
                     })
                 })
                 .collect();

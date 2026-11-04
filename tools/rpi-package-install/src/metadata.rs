@@ -13,6 +13,36 @@ pub struct Extension {
     pub package: String,
     /// Built artifact file stem, e.g. `rpi_langfuse`.
     pub artifact: String,
+    /// Extra files the package ships beside its library.
+    ///
+    /// A package may build a binary next to its extension — a supervisor that
+    /// has to outlive the host, for instance. The binary is useless without the
+    /// library, and the library is useless without the binary, so the two are
+    /// installed together.
+    pub extras: Vec<ExtraFile>,
+}
+
+/// A file that ships with an extension but is not the extension itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraFile {
+    /// Built artifact file stem, e.g. `rpi_superagent_supervisor`.
+    pub artifact: String,
+    /// The binary's role in the file name it installs under.
+    pub role: ExtraRole,
+}
+
+/// What an extra file is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtraRole {
+    /// A helper the extension starts on its own.
+    Helper,
+}
+
+impl ExtraFile {
+    /// File name of the built artifact on this host.
+    pub fn file_name(&self) -> String {
+        super::platform::exe_name(&self.artifact)
+    }
 }
 
 impl Extension {
@@ -128,9 +158,31 @@ fn parse(json: &serde_json::Value) -> Result<Workspace> {
             } else {
                 format!("lib{target_name}")
             };
+            // A package may also build binaries that ship beside the library.
+            let mut extras = Vec::new();
+            for target in package["targets"].as_array().into_iter().flatten() {
+                let is_bin = target["kind"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|k| k.as_str() == Some("bin"));
+                if !is_bin {
+                    continue;
+                }
+                let Some(target_name) = target["name"].as_str() else {
+                    continue;
+                };
+                // A binary target's artifact carries no `lib` prefix; that is
+                // a library convention, not a binary one.
+                extras.push(ExtraFile {
+                    artifact: target_name.to_string(),
+                    role: ExtraRole::Helper,
+                });
+            }
             extensions.push(Extension {
                 package: name.clone(),
                 artifact,
+                extras,
             });
         }
     }
