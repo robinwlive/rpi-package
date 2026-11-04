@@ -25,12 +25,18 @@ use std::sync::Mutex;
 /// id, not by name.
 const GET_EXECUTION_CONTEXT: u32 = 23;
 
+/// ABI id of `RuntimeActionId::GetSessionBranch`.
+const GET_SESSION_BRANCH: u32 = 20;
+
 /// Process-lifetime host function pointers. Never retain a registration's
 /// `user_data`: a candidate reload may be rolled back and freed.
 #[derive(Clone, Copy)]
 struct RuntimeFns {
     action: extern "C" fn(u32, StbStringRef, *mut StbString, *mut c_void) -> i32,
     free: extern "C" fn(StbString),
+    /// The registration's opaque handle. The host recovers the session bridge
+    /// from it, so an action can be driven without a per-call invocation handle.
+    user_data: usize,
 }
 
 static HOST: Mutex<Option<RuntimeFns>> = Mutex::new(None);
@@ -40,6 +46,7 @@ pub(crate) fn install(plugin: &rpi_plugin_sdk::PluginApi) {
     *HOST.lock().unwrap_or_else(|error| error.into_inner()) = Some(RuntimeFns {
         action: plugin.runtime_action,
         free: plugin.free_string,
+        user_data: plugin.user_data as usize,
     });
 }
 
@@ -106,6 +113,50 @@ fn runtime_handle(params: &Value) -> Option<usize> {
         .filter(|id| *id != 0)
 }
 
+/// The names of every tool registered in the calling session, including tools
+/// other plugins contributed.
+///
+/// `GetExecutionContext` answers from the host's active tool set, so this sees
+/// `plan` / `dispatch` when `rpi-orchestrator` is installed alongside this
+/// package. It is the only way to detect that neighbour: the plugin ABI has no
+/// "list other plugins" call, and `before_agent_start` receives no invocation
+/// handle — but the host still recovers the session bridge from the
+/// registration's `user_data`, so the action works from there.
+///
+/// Empty when the host cannot answer; the caller then treats the neighbour as
+/// absent rather than guessing.
+pub(crate) fn registered_tool_names() -> Vec<String> {
+    let Some(host) = *HOST.lock().unwrap_or_else(|error| error.into_inner()) else {
+        return Vec::new();
+    };
+    let mut out = StbString::empty();
+    let rc = (host.action)(
+        GET_EXECUTION_CONTEXT,
+        StbStringRef::from_str("{}"),
+        &mut out as *mut StbString,
+        host.user_data as *mut c_void,
+    );
+    let text = out.to_string_lossy();
+    (host.free)(out);
+    if rc != 0 {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Read the calling session's binding from the host. Best-effort by design: a
 /// missing bridge, a missing handle, a failing action or a malformed reply all
 /// yield an empty selection.
@@ -147,6 +198,56 @@ pub(crate) fn selection_from_context(context: &Value) -> Selection {
         provider: field("provider"),
         model: field("id"),
     }
+}
+
+/// Invoke a host runtime action using the registration's own handle.
+///
+/// The host recovers the session bridge from `PluginApi::user_data`, so an
+/// action can be driven without a per-call invocation handle. `before_agent_start`
+/// has no such handle, but the registration's is always valid, which is what
+/// makes this usable from a prompt transform as well as from a tool call.
+pub(crate) fn call_action(action: u32, args: &Value) -> Result<Value, String> {
+    let Some(host) = *HOST.lock().unwrap_or_else(|error| error.into_inner()) else {
+        return Err("the host action bridge is not installed".into());
+    };
+    let mut out = StbString::empty();
+    let rc = (host.action)(
+        action,
+        StbStringRef::from_str(&args.to_string()),
+        &mut out as *mut StbString,
+        host.user_data as *mut c_void,
+    );
+    let text = out.to_string_lossy();
+    (host.free)(out);
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid action reply (status {rc}): {error}"))?;
+    if rc != 0 {
+        return Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the host action failed")
+            .to_string());
+    }
+    Ok(value)
+}
+
+/// The leaf the main lane currently points at, when the host reports it.
+///
+/// A task's state is scoped to a branch, so a snapshot records the branch it
+/// was written on. The host exposes this through `GetSessionBranch`'s
+/// `leafId`.
+pub(crate) fn current_branch_id() -> Option<String> {
+    let reply = call_action(
+        GET_SESSION_BRANCH,
+        &serde_json::json!({"customTypes": [crate::task::TASK_ENTRY_TYPE], "order": "oldestFirst"}),
+    )
+    .ok()?;
+    reply
+        .get("leafId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 /// Invoke a host runtime action and parse its JSON reply.

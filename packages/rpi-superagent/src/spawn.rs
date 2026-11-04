@@ -182,10 +182,31 @@ pub fn run_with_exe(
     model: Option<&str>,
     control: &Control,
 ) -> Result<String, String> {
+    run_with_exe_reporting(exe, task, max_turns, timeout_secs, provider, model, control, &mut |_| {})
+}
+
+/// [`run_with_exe`], reporting the child's process id once it starts.
+///
+/// The id lets a caller find the child later — for example to clean up after
+/// the host died and left it running.
+// The argument list mirrors `run_with_exe` plus the callback; splitting it into
+// a struct would mean rewriting every caller for one extra field.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_exe_reporting(
+    exe: &Path,
+    task: &str,
+    max_turns: u64,
+    timeout_secs: u64,
+    provider: Option<&str>,
+    model: Option<&str>,
+    control: &Control,
+    on_started: &mut dyn FnMut(u32),
+) -> Result<String, String> {
     // Fail before launching anything if already cancelled.
     control.check()?;
     let (mut child, tree) = spawn_command(&mut child_command(exe, max_turns, provider, model))
         .map_err(|err| format!("failed to start subagent `{}`: {err}", exe.display()))?;
+    on_started(child.id());
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     // Drain stdout/stderr on their own threads so a chatty child cannot block on
@@ -278,9 +299,70 @@ pub(crate) fn kill_and_reap(child: &mut Child, tree: &ProcessTree) {
     let _ = child.wait();
 }
 
+/// Kill a process and everything it spawned.
+///
+/// The child is signalled directly rather than through its process group:
+/// a group kill needs the caller to be a member of that group, and an orphan
+/// left by a dead host belongs to a group nobody else is in. Signalling the
+/// pid works from anywhere, for the same user.
+///
+/// The descendants are killed first, because the child's own death would
+/// reparent them and hide them from the parent lookup.
+pub(crate) fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        kill_descendants(pid);
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .status();
+    }
+}
+
+/// Whether a process is still running.
+///
+/// A zombie counts as gone: it has finished, and only the bookkeeping entry
+/// remains. `kill -0` reports a zombie as present, so the state is checked
+/// too — otherwise a dead child would look alive forever.
+pub(crate) fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !alive {
+            return false;
+        }
+        // A zombie is finished work: `ps` reports it as `Z`.
+        let state = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        !state.starts_with('Z')
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
+            .unwrap_or(false)
+    }
+}
+
 /// Best-effort recursive SIGKILL of `pid` and everything below it (unix).
 #[cfg(unix)]
-fn kill_descendants(pid: u32) {
+pub(crate) fn kill_descendants(pid: u32) {
     if let Ok(output) = std::process::Command::new("pgrep")
         .arg("-P")
         .arg(pid.to_string())
@@ -357,7 +439,7 @@ mod tests {
     fn collect_after_parent_exit(cancel: bool) {
         let _serial = PROCESS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let pid_file = std::env::temp_dir().join(format!(
-            "rpi-orchestrator-pipes-{}-{}.pid",
+            "rpi-superagent-pipes-{}-{}.pid",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -464,7 +546,7 @@ mod tests {
         use std::os::windows::process::CommandExt;
         const NO_WINDOW: u32 = 0x08000000;
         let pid_file = std::env::temp_dir().join(format!(
-            "rpi-orchestrator-child-{}-{}.pid",
+            "rpi-superagent-child-{}-{}.pid",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -735,7 +817,7 @@ mod tests {
         let control = Control::default();
         control.cancel();
         let err = run_with_exe(
-            Path::new("/nonexistent/orchestrator-child"),
+            Path::new("/nonexistent/superagent-child"),
             "ignored",
             8,
             5,

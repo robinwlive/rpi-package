@@ -43,12 +43,27 @@ fn parameters(name: &str) -> Value {
                 "addNodes":{"type":"array", "items":node_schema(), "description":"action=update: append new ids, before removals and dependency edits. Empty array is allowed."},
                 "removeIds":{"type":"array", "items":nonblank_string(), "description":"action=update: remove ids (trimmed); unknown ids are ignored. Repair remaining dependencies in the same update."},
                 "setDeps":{"type":"array", "items":{"type":"object", "properties":{"id":{"type":"string", "description":"Exact existing node id; unlike creation this field is NOT trimmed."}, "deps":string_list()}, "required":["id","deps"], "additionalProperties":true}, "description":"action=update: replace dependencies for existing ids; empty deps clears them. Dependency ids are trimmed and deduplicated."},
-                "reset":{"type":"array", "items":nonblank_string(), "description":"action=update: re-arm existing ids to pending and clear their results. Also reset skipped dependents when retrying; this is not automatic."}
+                "reset":{"type":"array", "items":nonblank_string(), "description":"action=update: re-arm existing ids to pending and clear their results. Also reset skipped dependents when retrying; this is not automatic."},
+                "taskId":{"type":"string", "description":"The long task this plan belongs to. When set, dispatch records the plan's progress on that task automatically, so you do not have to update it by hand. A plan without one is still fine."}
             },
             "allOf":[{"if":{"properties":{"action":{"const":"set"}},"required":["action"]},"then":{"required":["nodes"]}}]
         }),
         "superagent_dispatch" => {
             json!({"type":"object", "additionalProperties":true, "properties":{"maxParallel":{"type":"integer", "minimum":1, "maximum":16, "default":4, "description":"Concurrent children within this wave, 1..16; default 4. All nodes ready at wave start are attempted, in batches if needed."}}})
+        }
+        "superagent_task" => {
+            json!({
+                "type":"object",
+                "additionalProperties":true,
+                "properties":{
+                    "action":{"type":"string","enum":["create","update","list"],"default":"list","description":"create writes a task's first snapshot; update writes a new snapshot for an existing task, which is how its state changes; list reads every task back, folded to its latest snapshot."},
+                    "taskId":{"type":"string","description":"Stable task identity. Required for create and update; the same id across snapshots is what makes them one task."},
+                    "title":{"type":"string","description":"Short human-readable label for the task."},
+                    "stage":{"type":"string","enum":["pending","working","needsPerson","failed","done"],"description":"Where the task stands. needsPerson means it is waiting on a person to answer or review."},
+                    "nodes":{"type":"array","items":nonblank_string(),"description":"Node ids of the task DAG this task is running, when it has one."},
+                    "error":{"type":"string","description":"Why the task stopped, when it did."}
+                }
+            })
         }
         _ => unreachable!("unknown superagent tool"),
     }
@@ -57,7 +72,8 @@ fn parameters(name: &str) -> Value {
 pub(super) fn tool_schema(name: &str) -> StableToolSchema {
     let description = match name {
         "superagent_delegate" => "Run one bounded task in a fresh rpi subprocess, not the host-managed in-memory delegate_task. No parent conversation is copied; pass scope, file ownership, constraints and acceptance criteria in task. The child shares cwd/files/environment (no isolated worktree or sandbox), so avoid concurrent writes to the same files. Returns bounded output, not proof of task completion; inspect and verify it. Children cannot call superagent_delegate/superagent_plan/superagent_dispatch. Prefer the host-managed delegate_task tool for in-process delegation on the current execution binding, or superagent_plan + superagent_dispatch for dependency scheduling.",
-        "superagent_plan" => "Author the session-scoped in-memory execution DAG, NOT plan_mode's read-only design/approval workflow. set replaces nodes; update applies addNodes, removeIds, setDeps, reset in that order and validates atomically; show (default) inspects. Only edit between dispatch waves. Nodes need self-contained tasks and non-overlapping write ownership in the shared workspace. Declare expectFile/verify acceptance checks: only dispatch can mark completion, and exit 0 alone can include a turn-limited incomplete answer. Session switches clear this graph; it is not a durable queue.",
+        "superagent_task" => "Track a long task across restarts. create writes a task, update records a new state for it, and list shows every task with its latest state. State is stored in the session branch, so it survives a process restart but is scoped to the current branch: rewinding the session hides the task list. Use this for work that outlives one turn; use plan/dispatch for the execution graph itself.",
+        "superagent_plan" => "Author the session-scoped in-memory execution DAG, NOT plan_mode's read-only design/approval workflow. set replaces nodes; update applies addNodes, removeIds, setDeps, reset in that order and validates atomically; show (default) inspects. Only edit between dispatch waves. Nodes need self-contained tasks and non-overlapping write ownership in the shared workspace. Declare expectFile/verify acceptance checks: only dispatch can mark completion, and exit 0 alone can include a turn-limited incomplete answer. Session switches clear this graph; it is not a durable queue. Pass taskId to bind the plan to a long task: dispatch then records the plan's progress on that task by itself.",
         "superagent_dispatch" => "Execute one ready wave of the current plan using bounded rpi child processes. Call superagent_plan(action=set) first. All pending nodes whose dependencies are done at wave start run in batches up to maxParallel; newly unblocked nodes wait for the next call. Overlapping dispatch/edit calls are rejected. Inspect results and acceptance checks before the next wave; failed dependencies cause skipped nodes, and retries require explicit plan(update, reset). Shared files are not isolated: parallelize only independent work. Returns bounded per-node summaries and the updated graph.",
         _ => unreachable!("unknown superagent tool"),
     };
@@ -78,7 +94,7 @@ mod tests {
 
     #[test]
     fn registered_schemas_are_json_and_allow_host_context() {
-        for name in ["superagent_delegate", "superagent_plan", "superagent_dispatch"] {
+        for name in ["superagent_delegate", "superagent_plan", "superagent_dispatch", "superagent_task"] {
             let schema = registered(name);
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["additionalProperties"], true); // includes __rpi

@@ -33,11 +33,18 @@ pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<S
                 .get("nodes")
                 .ok_or("`nodes` is required for action=set")?;
             *graph = Graph::from_nodes_value(nodes)?;
+            // A plan may name the long task it belongs to. `dispatch` then
+            // records that task's progress without the caller having to
+            // update it by hand.
+            graph.task_id = task_id_of(params);
         }
         "update" => {
             let mut next = graph.clone();
             apply_update(&mut next, params)?;
             next.validate()?;
+            if params.get("taskId").is_some() {
+                next.task_id = task_id_of(params);
+            }
             *graph = next;
         }
         "show" => {}
@@ -52,6 +59,16 @@ pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<S
         guard.advance_generation();
     }
     Ok(result)
+}
+
+/// The task id a plan is bound to, when it names one.
+fn task_id_of(params: &Value) -> Option<String> {
+    params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 fn apply_update(graph: &mut Graph, params: &Value) -> Result<(), String> {
@@ -120,6 +137,9 @@ fn apply_update(graph: &mut Graph, params: &Value) -> Result<(), String> {
                 .ok_or_else(|| format!("node `{id}` not found"))?;
             node.status = Status::Pending;
             node.result = None;
+            // A re-armed node has not failed yet: a stale reason would make a
+            // pending node look like it already failed.
+            node.error = None;
         }
     }
     Ok(())
@@ -156,6 +176,20 @@ mod tests {
 
         apply_update(&mut g, &json!({"removeIds": ["c"]})).unwrap();
         assert!(g.get("c").is_none());
+    }
+
+    #[test]
+    fn reset_clears_a_previous_failure_reason() {
+        let mut g = seeded();
+        let node = g.get_mut("a").unwrap();
+        node.status = Status::Failed;
+        node.error = Some("boom".to_string());
+        apply_update(&mut g, &json!({"reset": ["a"]})).unwrap();
+        let node = g.get("a").unwrap();
+        assert_eq!(node.status, Status::Pending);
+        // A re-armed node must not still show why it failed last time.
+        assert_eq!(node.error, None);
+        assert!(!g.render().contains("boom"), "got: {}", g.render());
     }
 
     #[test]

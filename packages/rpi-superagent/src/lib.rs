@@ -1,11 +1,15 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 // The `export_plugin!` expansion exposes the raw-pointer ABI entrypoints the host
 // calls. Every other plugin crate in this workspace carries the same allow (see
 // rpi-acp, rpi-btw, rpi-subagents, rpi-ui-adapter); without it
-// `cargo clippy -p rpi-orchestrator` fails on the macro expansion alone.
+// `cargo clippy -p rpi-superagent` fails on the macro expansion alone.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+//
+// `deny` rather than `forbid`: the supervisor module needs `fork`, `setsid`
+// and `flock`, which have no safe equivalents. It re-enables unsafe for
+// itself alone; every other module in this crate stays unsafe-free.
 
-//! `rpi-orchestrator` — DAG subagent orchestration for the rpi Rust agent.
+//! `rpi-superagent` — super-agent orchestration for the rpi Rust agent.
 //!
 //! A subagent is a child `rpi` process. Three tools share one session-scoped
 //! task graph:
@@ -21,6 +25,7 @@
 //! stages: `DESIGN.md`.
 
 mod control;
+mod guide;
 mod dispatch;
 mod graph;
 mod host;
@@ -28,6 +33,8 @@ mod kit;
 mod plan;
 mod spawn;
 mod subagent;
+pub mod supervisor;
+mod task;
 mod tool_schema;
 
 use serde_json::Value;
@@ -129,78 +136,10 @@ impl GraphState {
 crate::tool_entry!(subagent_tool, crate::subagent::subagent);
 crate::tool_entry!(plan_tool, crate::plan::plan);
 crate::tool_entry!(dispatch_tool, crate::dispatch::dispatch);
+crate::tool_entry!(task_tool, crate::task::task);
 
-/// Optional override for the orchestration guidance injected into the system
-/// prompt. Guidance is **on by default whenever a goal is active** — `/goal`
-/// implies orchestration, so no variable is needed. This only forces the decision:
-/// `0/false/no/off` disables it even with a goal, `1/true/yes/on` enables it even
-/// without one.
-pub const GUIDE_ENV: &str = "RPI_ORCHESTRATOR_GUIDE";
+pub use crate::guide::GUIDE_ENV;
 
-/// Project-relative path of `rpi-goal`'s state. An active goal there is what turns
-/// the guidance on — a deliberate coupling to `/goal` mode.
-const GOALS_FILE: &str = ".rpi/goals.json";
-
-const GUIDE_HEADING: &str = "## Subagent orchestration";
-
-const GUIDE_SECTION: &str = r#"## Subagent orchestration
-
-For work that has several steps, or steps that can run in parallel, use the
-`plan` and `dispatch` tools instead of doing everything inline:
-
-1. `plan` with action=set: write the task graph as nodes, each with an `id`, a
-   self-contained `task`, and its `deps`.
-2. `dispatch`: run the current ready wave. Nodes whose dependencies are done run
-   in parallel (up to `maxParallel`).
-3. Read the results, then `plan` with action=update (add/remove/re-dep/reset
-   nodes) and `dispatch` again until the goal is met.
-
-A subagent starts fresh and cannot see this conversation, so each node's `task`
-must contain everything it needs. Prefer this over hand-rolling the whole
-workflow with `bash`."#;
-
-/// Tri-state read of [`GUIDE_ENV`]: `Some(true)` force on, `Some(false)` force
-/// off, `None` means "decide from the goal state".
-fn guide_override(value: Option<&str>) -> Option<bool> {
-    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("1" | "true" | "yes" | "on") => Some(true),
-        Some("0" | "false" | "no" | "off") => Some(false),
-        _ => None,
-    }
-}
-
-/// Whether `rpi-goal` has an active goal in this project. Parsed leniently: any
-/// read or parse problem simply means "no goal".
-fn active_goal_from(text: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return false;
-    };
-    let Some(active) = value.get("active") else {
-        return false;
-    };
-    !active.is_null() && active.get("status").and_then(Value::as_str) == Some("active")
-}
-
-fn active_goal_in_project() -> bool {
-    let Ok(cwd) = std::env::current_dir() else {
-        return false;
-    };
-    match std::fs::read_to_string(cwd.join(GOALS_FILE)) {
-        Ok(text) => active_goal_from(&text),
-        Err(_) => false,
-    }
-}
-
-fn guide_enabled() -> bool {
-    // Never inject into a subagent: it has no `plan`/`dispatch`, and telling it to
-    // use them would just waste a turn.
-    if std::env::var(crate::spawn::SUBAGENT_ENV).is_ok() {
-        return false;
-    }
-    // `/goal` implies orchestration: an active goal turns the guidance on unless
-    // the variable explicitly overrides the decision.
-    guide_override(std::env::var(GUIDE_ENV).ok().as_deref()).unwrap_or_else(active_goal_in_project)
-}
 
 fn write_out(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value) {
     if out.is_available() {
@@ -216,10 +155,6 @@ rpi_plugin_sdk::string_handler! {
 /// `{}` (no change) otherwise. A malformed envelope declines rather than
 /// replacing the host's prompt with our section alone.
 fn on_before_agent_start(event_json, out, _user_data) {
-    if !guide_enabled() {
-        write_out(out, serde_json::json!({}));
-        return 0;
-    }
     let parsed: Value = match serde_json::from_str(event_json) {
         Ok(value) => value,
         Err(_) => {
@@ -231,11 +166,27 @@ fn on_before_agent_start(event_json, out, _user_data) {
         .get("systemPrompt")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if base.contains(GUIDE_HEADING) {
+
+    // The tool guidance goes in whenever the model has a prompt to answer,
+    // whether or not a goal is active: the tools are registered either way,
+    // and a registered tool the model was never told about is one it will not
+    // use. The orchestration guidance stays behind its goal condition.
+    let mut next = base.to_string();
+    let mut changed = false;
+    if let Some(tools) = crate::guide::apply_tools_to_prompt(&next) {
+        next = tools;
+        changed = true;
+    }
+    if crate::guide::guide_enabled() {
+        if let Some(guide) = crate::guide::apply_to_prompt(&next) {
+            next = guide;
+            changed = true;
+        }
+    }
+    if !changed {
         write_out(out, serde_json::json!({}));
         return 0;
     }
-    let next = format!("{base}\n\n{GUIDE_SECTION}");
     write_out(out, serde_json::json!({"systemPrompt": next}));
     0
 }
@@ -246,6 +197,13 @@ rpi_plugin_sdk::export_plugin!(|api| {
     // session's provider/model through it so a child inherits the parent binding
     // instead of quietly resolving the default provider.
     crate::host::install(api);
+
+    // A host that dies leaves its children running, and nothing in the
+    // session can clean them up afterwards. The supervisor is a separate
+    // process for exactly that reason.
+    crate::supervisor::start_supervisor();
+
+
     if let Some(register_prompt) = api.register_before_agent_start {
         let _ = register_prompt(
             on_before_agent_start,
@@ -305,6 +263,23 @@ rpi_plugin_sdk::export_plugin!(|api| {
             return 1;
         }
     }
+
+    {
+        let schema = Box::new(crate::tool_schema::tool_schema("superagent_task"));
+        let rc = register(
+            &*schema,
+            task_tool::execute,
+            task_tool::poll,
+            task_tool::cancel,
+            task_tool::destroy,
+            crate::kit::plugin_free_string,
+        );
+        drop(schema);
+        if rc != 0 {
+            return 1;
+        }
+    }
+
     0
 });
 
@@ -312,30 +287,7 @@ rpi_plugin_sdk::export_plugin!(|api| {
 mod tests {
     use super::*;
 
-    #[test]
-    fn guide_env_override_is_tri_state() {
-        for value in ["1", "true", "TRUE", "yes", "on", " on "] {
-            assert_eq!(guide_override(Some(value)), Some(true), "{value}");
-        }
-        for value in ["0", "false", "no", "off", " OFF "] {
-            assert_eq!(guide_override(Some(value)), Some(false), "{value}");
-        }
-        assert_eq!(guide_override(None), None);
-        assert_eq!(guide_override(Some("")), None);
-        assert_eq!(guide_override(Some("whatever")), None);
-    }
 
-    #[test]
-    fn active_goal_is_detected_from_the_project_state() {
-        assert!(active_goal_from(
-            r#"{"active":{"status":"active"},"archived":[]}"#
-        ));
-        assert!(!active_goal_from(r#"{"active":null,"archived":[]}"#));
-        assert!(!active_goal_from(r#"{"active":{"status":"paused"}}"#));
-        assert!(!active_goal_from(r#"{"active":{"status":"complete"}}"#));
-        assert!(!active_goal_from("{}"));
-        assert!(!active_goal_from("not json"));
-    }
 
     /// The graph is process-global by design, so graph-mutating tests must not
     /// interleave. A poisoned lock is recovered (a failed test still releases it).
@@ -372,11 +324,11 @@ mod tests {
             &params,
             &control,
             &progress,
-            |graph, ready, parallel, control, progress, parent| {
+            |graph, ready, parallel, control, progress, parent, pids| {
                 // Cancel after dispatch marks the ready set running, but
                 // before run_wave starts its first chunk. No child may run.
                 control.cancel();
-                crate::dispatch::run_wave(graph, ready, parallel, control, progress, parent)
+                crate::dispatch::run_wave(graph, ready, parallel, control, progress, parent, pids)
             },
         )
         .unwrap();
@@ -398,7 +350,8 @@ mod tests {
                        _: usize,
                        _: &crate::control::Control,
                        _: &crate::kit::Progress,
-                       _: &crate::host::Selection| {
+                       _: &crate::host::Selection,
+                       _: &std::sync::Arc<std::sync::Mutex<Vec<u32>>>| {
             ready
                 .iter()
                 .map(|id| (id.clone(), Ok("fixture success".into())))
@@ -448,7 +401,7 @@ mod tests {
                 &wave_params,
                 &wave_control,
                 &std::sync::mpsc::channel().0,
-                |_, ready, _, _, _, _| {
+                |_, ready, _, _, _, _, _| {
                     ready
                         .iter()
                         .map(|id| (id.clone(), Ok("fixture result".into())))

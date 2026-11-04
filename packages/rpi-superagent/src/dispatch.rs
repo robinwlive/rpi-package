@@ -12,6 +12,8 @@ use crate::kit::{progress, result_with_details, Progress};
 use crate::spawn::{self, POLL_SLICE};
 use crate::{lock_graph, lock_graph_for_wave};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
@@ -42,6 +44,7 @@ pub(super) fn dispatch_with(
         &Control,
         &Progress,
         &crate::host::Selection,
+        &Arc<Mutex<Vec<u32>>>,
     ) -> Vec<(String, Result<String, String>)>,
 ) -> Result<String, String> {
     control.check()?;
@@ -81,6 +84,21 @@ pub(super) fn dispatch_with(
         }
     }
 
+    // Record the start of the wave on the long task, not just its end. The
+    // task's heartbeat is the last time the host wrote it, so a wave that
+    // takes a long time needs a write when it begins as well as when it
+    // finishes — otherwise the task looks abandoned while it is running.
+    let pids = Arc::new(Mutex::new(Vec::new()));
+    let heartbeat = graph
+        .task_id
+        .clone()
+        .and_then(|task_id| start_heartbeat(task_id, Arc::clone(&pids)));
+    if let Some(task_id) = graph.task_id.clone() {
+        if let Err(error) = record_progress(&task_id, graph, &[]) {
+            eprintln!("could not record the start of task `{task_id}`: {error}");
+        }
+    }
+
     // Snapshot before releasing the lock into the wave: the children run for a
     // long time and must not hold the state lock (a blocked wave must not block
     // `plan`, and vice versa).
@@ -96,12 +114,22 @@ pub(super) fn dispatch_with(
         control,
         progress_tx,
         &parent,
+        &pids,
     );
 
     // Reject an already stale wave before running acceptance commands, then
     // keep verification outside the graph lock so plan/show and session
     // switches remain responsive. Validate again before applying any results.
-    drop(lock_graph_for_wave(params, generation)?);
+    //
+    // A failure here returns early, so the heartbeat must already be stopped
+    // by then — otherwise a session switch would leave it writing to a
+    // session it no longer serves.
+    let wave = lock_graph_for_wave(params, generation);
+    if let Some((handle, stop)) = heartbeat {
+        stop.store(true, Ordering::Release);
+        let _ = handle.join();
+    }
+    drop(wave?);
     let outcomes: Vec<_> = outcomes
         .into_iter()
         .map(|(id, outcome)| {
@@ -157,8 +185,145 @@ pub(super) fn dispatch_with(
     }
     graph.propagate_skips();
 
-    let text = format!("dispatched {} node(s)\n\n{}", started.len(), graph.render());
+    // Record the wave's outcome on the long task this graph belongs to, if it
+    // names one. A failure to record must not fail the dispatch: the work ran,
+    // and the wave's own result is the authoritative account of it. The task
+    // record is a convenience for the next reader, not the source of truth.
+    let child_pids = pids.lock().map(|pids| pids.clone()).unwrap_or_default();
+    // The wave is over: these children are finished, so they need no guard
+    // against the reaper.
+    for pid in &child_pids {
+        release_child(*pid);
+    }
+    let task_note = match graph.task_id.clone() {
+        Some(task_id) => match record_progress(&task_id, graph, &child_pids) {
+            Ok(note) => note,
+            Err(error) => format!("could not record task `{task_id}`: {error}"),
+        },
+        None => String::new(),
+    };
+
+    let mut text = format!("dispatched {} node(s)\n\n{}", started.len(), graph.render());
+    if !task_note.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&task_note);
+    }
     Ok(result_with_details(&text, graph.to_details()))
+}
+
+/// The child processes this process started.
+///
+/// The reaper must not kill these: they are live work, and the host may run
+/// `list` while a wave is still running.
+static OWNED_CHILDREN: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+
+/// The children this process started.
+fn owned_children() -> &'static Mutex<Vec<u32>> {
+    OWNED_CHILDREN.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Whether this process started the given child.
+pub(crate) fn owns_child(pid: u32) -> bool {
+    owned_children()
+        .lock()
+        .map(|children| children.contains(&pid))
+        .unwrap_or(false)
+}
+
+/// Remember a child this process started.
+pub(crate) fn remember_child(pid: u32) {
+    if let Ok(mut children) = owned_children().lock() {
+        children.push(pid);
+    }
+}
+
+/// Forget a child this process started.
+///
+/// The list is a guard against the reaper killing live work; a child that has
+/// finished needs no guard, and keeping every pid forever would grow it
+/// without bound.
+pub(crate) fn release_child(pid: u32) {
+    if let Ok(mut children) = owned_children().lock() {
+        children.retain(|owned| *owned != pid);
+    }
+}
+
+/// How often a running wave refreshes its task's heartbeat.
+const HEARTBEAT_INTERVAL_SECS: u64 = 60;
+
+/// Keep the task's heartbeat alive while a wave runs.
+///
+/// The heartbeat is the last time the host wrote the task, so a wave that
+/// runs longer than the abandonment threshold would look abandoned while it
+/// is still working. A thread that writes a heartbeat every minute keeps the
+/// task's age below the threshold for as long as the wave lives, and stops
+/// writing when the wave ends.
+///
+/// The thread writes the task's own snapshot rather than the graph's derived
+/// state: the graph is owned by the dispatching thread, and a heartbeat only
+/// has to say "this is still alive", not what the state is.
+fn start_heartbeat(
+    task_id: String,
+    pids: Arc<Mutex<Vec<u32>>>,
+) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
+    if task_id.is_empty() {
+        return None;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || loop {
+        // Wake often enough that a stop is noticed promptly, but write only
+        // every interval.
+        let mut waited = 0;
+        while waited < HEARTBEAT_INTERVAL_SECS {
+            if flag.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            waited += 1;
+        }
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(Some(mut task)) = crate::task::read_task(&task_id) else {
+            // The task is gone, or the host cannot answer. Stop trying.
+            return;
+        };
+        if task.stage != crate::task::Stage::Working {
+            return;
+        }
+        task.branch_id = crate::host::current_branch_id();
+        // The heartbeat carries the live children's ids, so a process that
+        // starts later can find and kill children this one left behind.
+        task.pids = pids.lock().map(|pids| pids.clone()).unwrap_or_default();
+        if crate::task::append_task(&task).is_err() {
+            return;
+        }
+    });
+    Some((handle, stop))
+}
+
+/// Write the graph's implied state onto its long task.
+fn record_progress(
+    task_id: &str,
+    graph: &Graph,
+    child_pids: &[u32],
+) -> Result<String, String> {
+    let stage = crate::task::stage_for_graph(&graph.nodes);
+    let error = crate::task::error_for_graph(&graph.nodes);
+    let nodes: Vec<String> = graph.nodes.iter().map(|node| node.id.clone()).collect();
+
+    let mut task = crate::task::read_task(task_id)?.unwrap_or_else(|| crate::task::Task {
+        task_id: task_id.to_string(),
+        ..crate::task::Task::default()
+    });
+    task.stage = stage;
+    task.nodes = nodes;
+    task.error = error;
+    task.branch_id = crate::host::current_branch_id();
+    task.pids = child_pids.to_vec();
+    crate::task::append_task(&task)?;
+    Ok(format!("task `{task_id}` → {}", stage.as_str()))
 }
 
 /// Run `ids` with at most `max_parallel` children at a time, preserving input
@@ -170,6 +335,7 @@ pub(super) fn run_wave(
     control: &Control,
     progress_tx: &Progress,
     parent: &crate::host::Selection,
+    pids: &Arc<Mutex<Vec<u32>>>,
 ) -> Vec<(String, Result<String, String>)> {
     let mut out = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(max_parallel.max(1)) {
@@ -197,13 +363,27 @@ pub(super) fn run_wave(
                     let selection =
                         parent.effective(node.provider.as_deref(), node.model.as_deref());
                     let handle = scope.spawn(move || {
-                        spawn::run(
+                        let exe = match std::env::current_exe() {
+                            Ok(exe) => exe,
+                            Err(error) => {
+                                return Err(format!("cannot resolve the rpi executable: {error}"))
+                            }
+                        };
+                        let mut on_started = |pid: u32| {
+                            if let Ok(mut pids) = pids.lock() {
+                                pids.push(pid);
+                            }
+                            remember_child(pid);
+                        };
+                        spawn::run_with_exe_reporting(
+                            &exe,
                             &node.task,
                             node.max_turns,
                             node.timeout_secs,
                             selection.provider(),
                             selection.model(),
                             &control,
+                            &mut on_started,
                         )
                     });
                     (id, handle)
@@ -388,7 +568,7 @@ mod tests {
         assert!(verify_node(None, None, 5, &Control::default()).is_ok());
         assert!(verify_node(Some("Cargo.toml"), None, 5, &Control::default()).is_ok());
         assert!(verify_node(
-            Some("no-such-file-orchestrator.txt"),
+            Some("no-such-file-superagent.txt"),
             None,
             5,
             &Control::default()

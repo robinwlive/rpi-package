@@ -14,6 +14,15 @@ categories = ["development-tools"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+# The supervisor: a separate process that outlives the session that started it.
+# It is a binary rather than a thread because a thread dies with its host, and
+# a host that dies leaves its children running with nobody to collect them.
+# Named `-supervisor` so its debug-info stem does not collide with the
+# `rpi_superagent` cdylib in the same package.
+name = "rpi-superagent-supervisor"
+path = "src/bin/supervisor.rs"
+
 [dependencies]
 rpi-plugin-sdk = { workspace = true, features = ["process"] }
 serde_json = { workspace = true }

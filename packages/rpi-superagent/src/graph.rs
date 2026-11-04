@@ -144,6 +144,13 @@ impl Node {
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
     pub nodes: Vec<Node>,
+    /// The long task this graph belongs to, when it belongs to one.
+    ///
+    /// The task is the durable record; the graph is the in-memory execution
+    /// plan. Linking them lets `dispatch` record the task's progress without
+    /// the model having to remember to do it, which is the whole point: a
+    /// caller that has to sync two things by hand will eventually forget.
+    pub task_id: Option<String>,
 }
 
 impl Graph {
@@ -156,13 +163,19 @@ impl Graph {
         for item in array {
             nodes.push(Node::from_value(item)?);
         }
-        let graph = Graph { nodes };
+        let graph = Graph {
+            nodes,
+            task_id: None,
+        };
         graph.validate()?;
         Ok(graph)
     }
 
     pub fn to_details(&self) -> Value {
-        json!({"nodes": self.nodes.iter().map(Node::to_value).collect::<Vec<_>>()})
+        json!({
+            "nodes": self.nodes.iter().map(Node::to_value).collect::<Vec<_>>(),
+            "taskId": self.task_id,
+        })
     }
 
     pub fn get(&self, id: &str) -> Option<&Node> {
@@ -363,6 +376,27 @@ mod tests {
 
     fn graph(nodes: Value) -> Graph {
         Graph::from_nodes_value(&nodes).unwrap()
+    }
+
+    #[test]
+    fn render_shows_the_failure_reason() {
+        let mut g = graph(json!([{"id": "boom", "task": "x"}]));
+        let node = g.get_mut("boom").unwrap();
+        node.status = Status::Failed;
+        node.error = Some("expected file was not produced: out.txt".to_string());
+        let rendered = g.render();
+        assert!(
+            rendered.contains("[!] boom failed") && rendered.contains("out.txt"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_omits_a_reason_for_a_node_that_did_not_fail() {
+        let mut g = graph(json!([{"id": "ok", "task": "x"}]));
+        g.get_mut("ok").unwrap().status = Status::Done;
+        let rendered = g.render();
+        assert!(!rendered.contains("—"), "got: {rendered}");
     }
 
     #[test]

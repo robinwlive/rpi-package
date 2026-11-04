@@ -9,10 +9,13 @@
 
 ## 0. 一句话
 
-**rpi-superagent = fork 自 rpi-orchestrator 的执行内核 + 新增的 Ticket 领域层。**
+**rpi-superagent = fork 自 rpi-orchestrator 的执行内核 + 一个最小的长任务层。**
+
+**目标**：把「一个长任务」从「人盯着它跑」变成「人只在需要裁决时才出现」。
+完整目标陈述与验收标准见 [`00-GOALS-AND-DECISIONS.md`](00-GOALS-AND-DECISIONS.md) §1。
 
 执行内核（graph / dispatch / spawn / 验收 / 取消）已 e2e 验证，不重写；
-领域层（Source / Trigger / Thread / Eval / Mandate / Ticket / Subscription）全部新建。
+长任务层只做**两个新概念**（Task / Assignment 关联），不照搬 DeepSeek 的 7 个概念。
 
 ---
 
@@ -24,20 +27,16 @@
 | --- | --- | --- | --- |
 | Executor | `spawn.rs` | fork 自 `rpi-orchestrator/src/spawn.rs` | ✅ 原样继承 |
 | Assignment | `graph.rs` 的 `Node.status` | fork 自 `rpi-orchestrator/src/graph.rs` | ✅ 原样继承 |
-| Ticket | `graph.rs` 的 `Node` | fork 自 `rpi-orchestrator/src/graph.rs` | ⚠️ **改造**（加 Mandate / Subscription / stage） |
+| ~~Ticket~~ | ~~`graph.rs` 的 `Node`~~ | — | ❌ **已撤回**：改造 `Node` 是错误技术路径（审计指出，已核实） |
+| **Task**（长任务单元） | `task.rs` | — | 🆕 新增，与 `Node` **分离**（1:N，不是继承） |
+| Assignment（执行记录） | `graph.rs` 的 `Node` | fork 自 `rpi-orchestrator/src/graph.rs` | ✅ 原样继承（`Node` 本身不变） |
 | dispatch（跑一波） | `dispatch.rs` | fork 自 `rpi-orchestrator/src/dispatch.rs` | ⚠️ **改造**（写 Assignment 心跳、写失败原因） |
 | plan（改图） | `plan.rs` | fork 自 `rpi-orchestrator/src/plan.rs` | ✅ 原样继承 |
 | delegate（单任务） | `subagent.rs` | fork 自 `rpi-orchestrator/src/subagent.rs` | ✅ 原样继承 |
 | 工具注册骨架 | `kit.rs` / `tool_schema.rs` / `control.rs` / `host.rs` | fork 自同名前述 | ✅ 原样继承 |
 | 插件入口 | `lib.rs` | fork 自 `rpi-orchestrator/src/lib.rs` | ⚠️ **重写**（注册新工具集 + 去掉 orchestrator 的 goal 耦合） |
-| Source | `source.rs` | — | 🆕 新增 |
-| Trigger | `trigger.rs` | — | 🆕 新增 |
-| Thread | `thread.rs` | — | 🆕 新增 |
-| Eval | `eval.rs` | — | 🆕 新增 |
-| Mandate | `mandate.rs` | — | 🆕 新增 |
-| Ticket（领域） | `ticket.rs` | — | 🆕 新增 |
-| Subscription | `subscription.rs` | — | 🆕 新增 |
-| Policy（白名单/规则） | `policy.rs` | — | 🆕 新增 |
+| Source / Trigger / Thread / Eval / Mandate / Subscription / Policy | — | — | ❌ **已砍掉**（`00-GOALS-AND-DECISIONS.md` §1.6：单人场景下无价值） |
+| 消息 → Task 桥接 | `bridge.rs` | 复用 `rpi-im-message` 的 `SendUserMessage` | 🆕 新增（约 200~300 行） |
 | 常驻 passes 循环 | `passes.rs` | — | 🆕 新增（仿 `rpi-im-message`） |
 | 持久化 | `store.rs` | 参照 `rpi-durable` | 🆕 新增 |
 
@@ -72,6 +71,8 @@ rebase 冲突只可能出现在 `lib.rs` 和 `graph.rs` 两个文件。
 | 插件用户可见名 | `superagent` | — |
 | 工具前缀 | `superagent_` | 同 `rpi-codegraph` → `codegraph_*`、`rpi-mcp-adapter` → `mcp_*` |
 | 子代理标记环境变量 | `RPI_SUPERAGENT_SUBAGENT` | 原 `RPI_ORCHESTRATOR_SUBAGENT`，避免与 orchestrator 混淆 |
+| 编排引导开关 | `RPI_SUPERAGENT_GUIDE` | 原 `RPI_ORCHESTRATOR_GUIDE`。**两包共用一个变量时，设 `0` 想关 orchestrator 会把 superagent 也关掉，设 `1` 会同时打开两个** |
+| 引导段落标题 | `## Super-agent orchestration` | 原 `## Subagent orchestration`。宿主按标题去重，标题相同则**先加载的赢、另一个被静默跳过** |
 
 ### 2.1 工具名冲突如何避免
 
@@ -95,12 +96,21 @@ if self.tools.iter().any(|t| t.tool.name == tool.name) {
 
 ### 2.2 与 `rpi-orchestrator` 的共存
 
-改名后**工具层面零冲突**，两插件可同时安装。
+改名后**工具层面零冲突**，但**语义仍重叠**（同一套工作流的两个名字 + 同一个 `.rpi/goals.json`）。
 
-残留问题：语义重叠，模型可能在「派活」时混用。处理层次：
+**已实现自动让位**：`guide.rs` 的 `neighbour_is_installed()` 通过宿主的
+`GetExecutionContext` 读当前会话的 active tools，发现 `plan`/`dispatch`/`subagent`
+即判定 orchestrator 在场，**本插件不注入引导**——只剩一段引导，不会有两套冲突指令。
 
-1. **文档**：README 明确「装 superagent 时不要装 orchestrator；superagent 是其超集」
-2. **Prompt**：`superagent` 的引导里写明「多步任务用 `superagent_*`，不要用 `plan`/`dispatch`」
+> 技术约束（实测得出）：`before_agent_start` 的 envelope 只有 `sessionId`，
+> **没有 per-call 的 runtimeHandle**。但宿主能从注册时的 `PluginApi.user_data`
+> 恢复 session bridge，所以 `runtime_action(GetExecutionContext)` 在注入时刻
+> 仍可用——探测可行。实测 `tools` 数组确实含其它插件的工具名。
+
+其余处理层次：
+
+1. **文档**：README 顶部醒目写「不要同时安装」，并给出 `rpi uninstall` 命令
+2. **Prompt**：`superagent` 的引导里写明「多步任务用 `superagent_*`」
 3. **工具描述**：`superagent_plan` 的 description 里点名 `plan`/`dispatch` 是别的插件的
 
 > `superagent_delegate` 而非 `superagent_subagent`：`rpi-subagents` 已有 `delegate_task` 工具，
@@ -264,7 +274,12 @@ DeepSeek 的 worker 是**有状态 Session**，可 resume。
 
 ---
 
-## 6. Domain 层设计
+## 6. DeepSeek 原型的 Domain 层设计（参考，非我们的计划）
+
+> **⚠️ 本节是第一轮写的，按 DeepSeek 架构完整描述了 7 个概念。
+> 其中 Eval / Mandate / Policy / Subscription 已被砍掉（见 `00-GOALS-AND-DECISIONS.md` §1.6）。
+> 本节保留的价值是：记录 DeepSeek 原型**怎么解决**这些问题，
+> 将来若场景变成多人团队，可以从这里取回设计。**
 
 ### 6.1 概念与规则（引自 DeepSeek `001-domain.md`）
 
@@ -348,13 +363,18 @@ rpi 侧映射：
 
 | 阶段 | 内容 | 依赖 |
 | --- | --- | --- |
-| A | Ticket 域模型（改造 `graph.rs` 的 `Node`）+ 持久化 | `rpi-durable` 范式 |
-| B | Policy（白名单 / admission 表）+ Eval 的 gate 层 | A |
-| C | passes 常驻循环 + Source 抽象 | B |
-| D | 第一个 Source：`rpi-im-message`（飞书） | C |
-| E | Panel：接 pi-dingo-dash | A（读 Ticket 状态） |
-| F | worktree 隔离 | A |
-| G | Eval 的 assessment 层（LLM 判断） | B |
+| M1 | **最小 Task 结构 + 落盘 + 一个能读的视图** | 第一个能回答「解决了什么」的里程碑 |
+| M2 | 完整 Task 模型 + 状态机 + 恢复接管 | 跨重启的 `running` 被接管或标记 `abandoned` |
+| M3 | **常驻循环 + 飞书桥接**（复用 `rpi-im-message` 的 `SendUserMessage`） | M2 + `catalog` 分发 |
+| M4 | **worktree 隔离 + 打磨** | M2 |
+
+> **本表已被 [`00-GOALS-AND-DECISIONS.md`](00-GOALS-AND-DECISIONS.md) §3.3 修正。**
+> 原表的 7 个阶段（含 Policy / Eval / 自建 Source / 自建 Panel）按 DeepSeek 原型
+> 的完整架构设计，单人场景下大部分价值为零，已砍掉。规模从「12,390 行量级」
+> 重估为 **约 1,700 行新增**（不含继承的 3,900 行内核）。
+>
+> **M1/M2 的拆分理由**：第一个里程碑要能回答「你解决了什么问题」，
+> 所以把「最小 Task + 落盘 + 能读」放在一起，而不是先做完完整模型再做视图。
 
 ---
 
@@ -411,8 +431,25 @@ rpi 侧映射：
 | 注册调用改名 | `src/lib.rs` | ✅ |
 | 递归守卫名单改名 | `src/spawn.rs` | ✅ |
 | 子代理标记环境变量改名 | `src/spawn.rs` | ✅ |
-| `Node.error` 字段 + `render()` 显示失败原因 | `src/graph.rs` | ✅（待补 dispatch 写入） |
-| 失败原因写入 | `src/dispatch.rs` | ⬜ 待做 |
+| `Node.error` 字段 + `render()` 显示失败原因 | `src/graph.rs` | ✅ |
+| 失败原因写入 | `src/dispatch.rs` | ✅ |
+| `reset` 清 `error`（避免 pending 节点显示旧失败原因） | `src/plan.rs` | ✅ |
+| **`GUIDE_ENV` 改名 + 引导正文换新工具名 + 标题区分** | `src/lib.rs` | ✅ |
+| **引导逻辑摘成 `guide.rs`**（缩小 rebase 冲突面） | `src/guide.rs` | ✅ |
+| 测试夹具文件名去 `orchestrator` | `src/spawn.rs` `src/dispatch.rs` | ✅ |
+| 修 `/bin/false` 跨平台单测 | `src/spawn.rs` | ✅ |
+
+### 8.1 新增测试（53 个，全绿）
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `render_shows_the_failure_reason` | failed 节点渲染出 `— 原因` |
+| `render_omits_a_reason_for_a_node_that_did_not_fail` | 非失败节点不渲染多余分隔符 |
+| `reset_clears_a_previous_failure_reason` | reset 后 error 与渲染都清干净 |
+| `the_section_names_the_tools_this_package_registers` | **引导正文不含 `\`plan\`` / `\`dispatch\``** |
+| `the_injected_section_is_appended_to_the_base_prompt` | 注入保留 base，追加新段 |
+| `a_second_injection_is_skipped` | 按标题去重生效 |
+| `override_is_tristate` | GUIDE_ENV 三态解析 |
 
 ---
 
@@ -428,8 +465,14 @@ rpi 侧映射：
 | 6 | 单次 spawn 不可 resume → 失败重跑成本高 | 中 | 第一版接受；后续改 rpc 长驻 |
 | 7 | `rpi-orchestrator` 仍在演进而 fork 停滞 | 中 | 定期 rebase；内核尽量少改 |
 | 8 | 模型混用 `superagent_*` 与 `plan`/`dispatch` | 低 | 工具描述点名；README 说明不要同装 |
-| 9 | macOS 上 `/bin/false` 单测失败 | 低 | §5.8 的修法 |
+| 9 | macOS 上 `/bin/false` 单测失败 | 低 | ✅ 已修（§5.8） |
 | 10 | 评估层（LLM 判断）成本与延迟 | 中 | 第一版只做 gate；assessment 延后 |
+| 11 | **两包共用引导开关/标题导致静默互相干扰** | ~~高~~ | ✅ 已修：变量、标题、正文全部区分（§2） |
+| 12 | **`reset` 后 error 残留，pending 节点显示旧失败原因** | ~~中~~ | ✅ 已修 + 有测试（§8.1） |
+| 13 | **新字段零测试覆盖**（P0 类缺陷正是因此漏过） | ~~中~~ | ✅ 已修：补 7 个测试（§8.1） |
+| 14 | **rebase 冲突面集中在 `lib.rs` 整文件** | ~~中~~ | ✅ 已修：引导逻辑摘到 `guide.rs`，冲突面缩到几行注册代码 |
+| 15 | **两插件同装 → 两段引导同时注入**（模型收到两套冲突指令） | ~~高~~ | ✅ 已修：探测到邻居即让位（§2.2）。**已实机复现并验证修复** |
+| 16 | 引导注入时机拿不到 per-call runtimeHandle | 中 | ✅ 非阻塞：`runtime_action` 可用注册时的 `user_data` 恢复 bridge（§2.2） |
 
 ---
 
@@ -455,20 +498,30 @@ rpi 侧映射：
 
 ## 11. 下一步
 
-**立刻可做（不依赖未读项）**
+**已完成（第一轮 + 首轮审计修复）**
 
-1. `dispatch.rs` 写入 `node.error`（§8 剩的一项）
-2. 修 `/bin/false` 跨平台单测（§5.8）
-3. 更新 README：fork 说明 + 双向映射表 + 与 orchestrator 的共存说明
-4. 重跑 4 个 e2e 场景，确认改名后一切照旧（工具名、递归守卫、环境变量）
+1. ✅ fork + 改名 + 工具改名 + 注册进 workspace
+2. ✅ `Node.error` + 渲染 + dispatch 写入 + `reset` 清除
+3. ✅ `GUIDE_ENV` / 标题 / 正文全部改名（首轮遗漏，首轮审计发现）
+4. ✅ 引导逻辑摘成 `guide.rs`，缩小 rebase 冲突面
+5. ✅ 测试夹具改名；修 `/bin/false` 跨平台单测
+6. ✅ README 重写；本文档 §2 / §8 / §9 / §11 同步更新
+7. ✅ 53 个单测全绿；clippy 干净；e2e 验证工具名与引导内容正确
 
-**然后读 2 个文件**
+**下一步（读 3 个文件，对应 `00-GOALS-AND-DECISIONS.md` §6）**
 
-5. 读 `rpi-durable/src/lib.rs` → 定 Ticket 持久化范式
-6. 读 `rpi-harness/src/runtime.rs` → 定崩溃恢复边界
+8. 读 `rpi-durable/src/lib.rs` → **验证** session-branch custom entry 能否存 Task
+   （G1 已降级为前置阅读，**默认方案 A**，不可行才重新决策）
+9. 读 `rpi-harness/src/runtime.rs` → 定跨重启恢复边界
+10. 读 Dash 的 `crates/core/src/dingo.rs` 全文 + `router.rs`
+    → 定任务维度的判定链（**注意：`DingoItem` 强绑定 `SessionMeta`，
+    `classify_one` 是会话维度的，任务维度需要新判定链，不是简单复用**）
 
 **然后开工阶段 A**
 
-7. `Node` → Ticket 域模型（加 Mandate / Subscription / stage）
-8. 持久化
-9. 阶段 A 的 e2e：建 Ticket → 落盘 → 重启 → 读回
+11. 写 `task.rs` 的**接口草案**（先不写实现），过一遍设计
+12. 实现 Task 模型 + 持久化
+13. 阶段 A 的 e2e：建 Task → 落盘 → 重启 → 读回
+
+> **不再计划内**：Eval、Mandate、Policy、Subscription、自建 Source、自建 Panel、
+> 自建 Executor。理由见 `00-GOALS-AND-DECISIONS.md` §1.6 与 §3.4。
