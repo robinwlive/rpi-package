@@ -32,6 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 mod cardkit;
 mod progress;
+mod orchestration;
 mod sessions;
 
 const EVENT_TYPE_MESSAGE: &str = "im.message.receive_v1";
@@ -709,6 +710,24 @@ async fn send_reaction(
     response.json_value().map_err(|error| error.to_string())
 }
 
+/// The working directory a topic's replies run in.
+///
+/// Session isolation is not enough: the tools read and write files in the
+/// process's working directory, so two topics that share one would keep
+/// overwriting each other's work. Each topic gets its own directory next to
+/// the session store.
+///
+/// Returns `None` when the directory cannot be created, in which case the
+/// child keeps the inherited working directory rather than failing to reply.
+fn topic_work_dir(session_id: &str) -> Option<std::path::PathBuf> {
+    let cwd = env::current_dir().ok()?;
+    let dir = cwd.join(".rpi").join("im-work").join(session_id);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    Some(dir)
+}
+
 fn invoke_print_process(
     prompt: &str,
     conversation_id: &str,
@@ -730,21 +749,31 @@ fn invoke_print_process(
         "--print".to_owned(),
         "--mode".to_owned(),
         "json".to_owned(),
-        "--no-extensions".to_owned(),
         "--timeout".to_owned(),
         timeout.as_secs().to_string(),
         "--session-id".to_owned(),
-        session_id,
+        session_id.clone(),
         "--append-system-prompt".to_owned(),
         FEISHU_SYSTEM_PROMPT.to_owned(),
     ];
+    // The child loads only the super-agent extension, and only if it is
+    // installed. `--local-only` keeps every other extension out — in particular
+    // this one, whose Feishu connection would spawn another child.
+    args.extend(orchestration::superagent_extension_args());
     args.extend(fallback_model_args(
         model,
         &env::args().skip(1).collect::<Vec<_>>(),
     ));
     args.push(prompt.to_owned());
-    let mut child = ProcessCommand::new("rpi")
-        .args(&args)
+    let mut command = ProcessCommand::new("rpi");
+    command.args(&args);
+    // A topic's work stays in its own directory. Without this, two topics
+    // in one group would share the inherited cwd and overwrite each other's
+    // files even though their sessions are separate.
+    if let Some(dir) = topic_work_dir(&session_id) {
+        command.current_dir(dir);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1904,6 +1933,21 @@ rpi_plugin_sdk::export_plugin!(|api| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 两个话题的工作目录必须不同：会话隔离挡不住两个进程写同一个文件。
+    #[test]
+    fn topics_get_separate_work_directories() {
+        let a = topic_work_dir("im-feishu-oc_g-topicA").unwrap();
+        let b = topic_work_dir("im-feishu-oc_g-topicB").unwrap();
+        assert_ne!(a, b, "两个话题不能共用一个工作目录");
+        assert!(a.is_dir() && b.is_dir(), "目录要真的建出来");
+        assert!(
+            a.ends_with("im-feishu-oc_g-topicA"),
+            "工作目录要按 session id 命名: {a:?}"
+        );
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
+    }
 
     #[test]
     fn registered_tool_schema_documents_actions_and_keeps_optional_fields() {

@@ -195,8 +195,39 @@ session identity: a message in one topic never continues the session of
 another topic in the same group, and the two never share history. Messages in
 the group's main area carry no root id and keep the plain per-chat session.
 
-The same rule applies to the fallback child process, so a topic keeps its own
+The same rule applies to the reply child process, so a topic keeps its own
 session there too.
+
+### The reply process loads the super-agent extension
+
+The reply runs in its own `rpi --print` child process, so it has a
+conversation of its own — one per topic, which is what keeps topics
+independent. That child would normally start with `--no-extensions`: a child
+that loaded *this* extension would open a second Feishu connection, and that
+connection would spawn another child, and so on.
+
+But with no extension the child has no orchestration tools — it cannot create
+a task, plan a DAG or dispatch work. So the child is started with
+`--local-only` and the super-agent extension named explicitly:
+
+```
+rpi --print --mode json --local-only --extension <superagent.dylib> --session-id <topic session> ...
+```
+
+`--local-only` loads only what was named, so the child gets the orchestration
+tools without this extension and without the recursion. When the super-agent
+extension is not installed, the child simply runs without it, as it did
+before.
+
+The extension is looked for in the host's extension directory — the same rule
+the host uses: `RPI_CODING_AGENT_DIR` when set, `~/.rpi/agent` otherwise.
+
+Session isolation alone is not enough: the reply's tools read and write files
+in the process's working directory, so two topics that shared one would keep
+overwriting each other's work. Each topic therefore runs in its own directory
+under `<working-directory>/.rpi/im-work/<session id>`. If the directory cannot
+be created, the child keeps the inherited working directory rather than
+failing to reply.
 
 Commands are handled locally without calling the model. Selection is scoped
 to the IM profile, chat and topic, and saved in
