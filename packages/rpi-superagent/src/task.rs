@@ -634,6 +634,7 @@ mod tests {
         Node {
             id: id.to_string(),
             task: "t".into(),
+            isolation: false,
             deps: Vec::new(),
             role: None,
             provider: None,

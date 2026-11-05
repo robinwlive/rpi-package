@@ -54,6 +54,7 @@ pub fn child_command(
     max_turns: u64,
     provider: Option<&str>,
     model: Option<&str>,
+    cwd: Option<&Path>,
 ) -> Command {
     let mut command = Command::new(exe);
     command
@@ -75,6 +76,9 @@ pub fn child_command(
         // Hard turn ceiling enforced by the harness, not the model.
         .env(MAX_TURNS_ENV, max_turns.to_string())
         .env(SUBAGENT_ENV, "1")
+        // A node that asked for isolation works in its own directory, so it
+        // cannot overwrite what another node is writing.
+        .current_dir(cwd.unwrap_or_else(|| Path::new(".")))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -182,7 +186,9 @@ pub fn run_with_exe(
     model: Option<&str>,
     control: &Control,
 ) -> Result<String, String> {
-    run_with_exe_reporting(exe, task, max_turns, timeout_secs, provider, model, control, &mut |_| {})
+    run_with_exe_reporting(
+        exe, task, max_turns, timeout_secs, provider, model, control, None, &mut |_| {},
+    )
 }
 
 /// [`run_with_exe`], reporting the child's process id once it starts.
@@ -200,12 +206,14 @@ pub fn run_with_exe_reporting(
     provider: Option<&str>,
     model: Option<&str>,
     control: &Control,
+    cwd: Option<&Path>,
     on_started: &mut dyn FnMut(u32),
 ) -> Result<String, String> {
     // Fail before launching anything if already cancelled.
     control.check()?;
-    let (mut child, tree) = spawn_command(&mut child_command(exe, max_turns, provider, model))
-        .map_err(|err| format!("failed to start subagent `{}`: {err}", exe.display()))?;
+    let (mut child, tree) =
+        spawn_command(&mut child_command(exe, max_turns, provider, model, cwd))
+            .map_err(|err| format!("failed to start subagent `{}`: {err}", exe.display()))?;
     on_started(child.id());
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -606,7 +614,7 @@ mod tests {
 
     #[test]
     fn child_command_sets_recursion_guard_and_turn_budget() {
-        let command = child_command(Path::new("/usr/bin/rpi"), 7, None, None);
+        let command = child_command(Path::new("/usr/bin/rpi"), 7, None, None, None);
         let args: Vec<String> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -643,6 +651,7 @@ mod tests {
             8,
             Some("deepseek"),
             Some("deepseek-flash"),
+            None,
         );
         let args: Vec<String> = command
             .get_args()
@@ -663,7 +672,7 @@ mod tests {
         );
 
         // Empty strings must be dropped rather than emitted as bare flags.
-        let bare = child_command(Path::new("/usr/bin/rpi"), 8, Some(""), None);
+        let bare = child_command(Path::new("/usr/bin/rpi"), 8, Some(""), None, None);
         let bare_args: Vec<String> = bare
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -689,6 +698,7 @@ mod tests {
             8,
             selection.provider(),
             selection.model(),
+            None,
         );
         let args: Vec<String> = command
             .get_args()

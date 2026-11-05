@@ -71,6 +71,26 @@ unified plugin ABI).
 If you only need a task DAG and no domain semantics, `rpi-orchestrator` is the
 smaller package. This one is a superset of it.
 
+## If a change seems to have no effect
+
+The host registers a tool **first-wins**: when two extensions offer a tool with
+the same name, the first one loaded keeps it and the other is dropped **without
+a warning** (`registry.rs:457`).
+
+Extensions are loaded from the agent's extension directory first and from
+explicit `-e` paths afterwards — so an **older build left in the extension
+directory silently wins** over the one you just compiled.
+
+Before debugging a change that appears to do nothing, check which build is
+actually loaded:
+
+```bash
+ls -la "${RPI_CODING_AGENT_DIR:-~/.rpi/agent}/extensions"
+```
+
+Removing the stale copy, or pointing at a clean agent directory, usually
+explains the mystery.
+
 ## What was changed from `rpi-orchestrator`
 
 | Change | Why |

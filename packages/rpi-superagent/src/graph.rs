@@ -42,6 +42,15 @@ pub struct Node {
     pub role: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Whether the node runs in its own working directory.
+    ///
+    /// Without it, parallel nodes share one directory and have to be given
+    /// non-overlapping write ownership by hand — a rule the model can forget.
+    /// With it, each node gets a directory of its own under
+    /// `<cwd>/.rpi/superagent-work/<run id>/<node id>`, and the acceptance
+    /// checks run there too, so `expectFile` names a path relative to that
+    /// node's own work.
+    pub isolation: bool,
     /// After the child exits successfully, this file must exist or the node is
     /// marked failed. The engine trusts exit codes otherwise, which lets a child
     /// that hit its turn cap "succeed" without producing anything.
@@ -93,6 +102,10 @@ impl Node {
         let model = string_field(value, "model");
         let expect_file = string_field(value, "expectFile");
         let verify = string_field(value, "verify");
+        let isolation = value
+            .get("isolation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let max_turns = clamp(
             value.get("maxTurns").and_then(Value::as_u64),
             DEFAULT_MAX_TURNS,
@@ -112,6 +125,7 @@ impl Node {
             role,
             provider,
             model,
+            isolation,
             expect_file,
             verify,
             max_turns,
@@ -130,6 +144,7 @@ impl Node {
             "role": self.role,
             "provider": self.provider,
             "model": self.model,
+            "isolation": self.isolation,
             "expectFile": self.expect_file,
             "verify": self.verify,
             "maxTurns": self.max_turns,
@@ -318,7 +333,15 @@ impl Graph {
             } else {
                 format!(" deps=[{}]", node.deps.join(","))
             };
-            let mut line = format!("[{}] {} {}{deps}", mark, node.id, node.status.as_str());
+            // Show the isolation setting: without it a caller cannot tell
+            // whether the field it passed was accepted or silently dropped.
+            let isolation = if node.isolation { " isolated" } else { "" };
+            let mut line = format!(
+                "[{}] {} {}{deps}{isolation}",
+                mark,
+                node.id,
+                node.status.as_str()
+            );
             if let Some(error) = &node.error {
                 let one_line = error.replace('\n', " ");
                 let one_line = one_line.trim();
@@ -421,6 +444,24 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("cycle"), "got: {err}");
+    }
+
+    /// A node that asks for isolation keeps the setting, and it is visible in
+    /// the rendering so a caller can tell the field was accepted.
+    #[test]
+    fn a_node_keeps_its_isolation_setting() {
+        let g = graph(json!([
+            {"id": "a", "task": "x", "isolation": true},
+            {"id": "b", "task": "y"}
+        ]));
+        assert!(g.get("a").unwrap().isolation, "isolation must survive parsing");
+        assert!(!g.get("b").unwrap().isolation, "isolation defaults to off");
+        let rendered = g.render();
+        assert!(rendered.contains("isolated"), "got: {rendered}");
+        // The setting is carried through to the details, so a plan can be
+        // replayed with it intact.
+        let details = g.to_details();
+        assert_eq!(details["nodes"][0]["isolation"], json!(true));
     }
 
     #[test]

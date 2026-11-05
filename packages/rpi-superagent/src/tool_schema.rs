@@ -25,8 +25,9 @@ fn node_schema() -> Value {
     let mut properties = worker_properties();
     properties["id"] = json!({"type":"string", "pattern":"\\S", "description":"Unique node id; trimmed. Dependencies must name existing ids and form an acyclic graph."});
     properties["deps"] = json!({"type":"array", "items":nonblank_string(), "default":[], "description":"Prerequisite node ids; trimmed and deduplicated. All must be done before this node runs."});
-    properties["expectFile"] = json!({"type":"string", "description":"Optional nonblank file path (trimmed), absolute or relative to the shared process cwd. After successful child exit the path must exist (directories also pass); existence only, not proof that this run created or changed it."});
-    properties["verify"] = json!({"type":"string", "description":"Optional nonblank shell command (trimmed) run in shared cwd after child success and expectFile check. Must exit 0; use focused acceptance checks, not untrusted commands. Not a sandbox."});
+    properties["isolation"] = json!({"type":"boolean", "default": false, "description":"Give the node its own working directory, so parallel nodes cannot overwrite each other's files. Use it when nodes write files. The node's expectFile and verify then run in that directory, and paths are relative to it."});
+    properties["expectFile"] = json!({"type":"string", "description":"Optional nonblank file path (trimmed), absolute or relative to the node's working directory (its own directory when isolation is on, the shared process cwd otherwise). After successful child exit the path must exist (directories also pass); existence only, not proof that this run created or changed it."});
+    properties["verify"] = json!({"type":"string", "description":"Optional nonblank shell command (trimmed) run in the node's working directory after child success and expectFile check. Must exit 0; use focused acceptance checks, not untrusted commands. Not a sandbox."});
     json!({"type":"object", "properties":properties, "required":["id","task"], "additionalProperties":true})
 }
 
@@ -73,7 +74,7 @@ pub(super) fn tool_schema(name: &str) -> StableToolSchema {
     let description = match name {
         "superagent_delegate" => "Run one bounded task in a fresh rpi subprocess, not the host-managed in-memory delegate_task. No parent conversation is copied; pass scope, file ownership, constraints and acceptance criteria in task. The child shares cwd/files/environment (no isolated worktree or sandbox), so avoid concurrent writes to the same files. Returns bounded output, not proof of task completion; inspect and verify it. Children cannot call superagent_delegate/superagent_plan/superagent_dispatch. Prefer the host-managed delegate_task tool for in-process delegation on the current execution binding, or superagent_plan + superagent_dispatch for dependency scheduling.",
         "superagent_task" => "Track a long task across restarts. create writes a task, update records a new state for it, and list shows every task with its latest state. State is stored in the session branch, so it survives a process restart but is scoped to the current branch: rewinding the session hides the task list. Use this for work that outlives one turn; use plan/dispatch for the execution graph itself.",
-        "superagent_plan" => "Author the session-scoped in-memory execution DAG, NOT plan_mode's read-only design/approval workflow. set replaces nodes; update applies addNodes, removeIds, setDeps, reset in that order and validates atomically; show (default) inspects. Only edit between dispatch waves. Nodes need self-contained tasks and non-overlapping write ownership in the shared workspace. Declare expectFile/verify acceptance checks: only dispatch can mark completion, and exit 0 alone can include a turn-limited incomplete answer. Session switches clear this graph; it is not a durable queue. Pass taskId to bind the plan to a long task: dispatch then records the plan's progress on that task by itself.",
+        "superagent_plan" => "Author the session-scoped in-memory execution DAG, NOT plan_mode's read-only design/approval workflow. set replaces nodes; update applies addNodes, removeIds, setDeps, reset in that order and validates atomically; show (default) inspects. Only edit between dispatch waves. Nodes need self-contained tasks; give a node isolation:true when it writes files, so parallel nodes cannot overwrite each other. Declare expectFile/verify acceptance checks: only dispatch can mark completion, and exit 0 alone can include a turn-limited incomplete answer. Session switches clear this graph; it is not a durable queue. Pass taskId to bind the plan to a long task: dispatch then records the plan's progress on that task by itself.",
         "superagent_dispatch" => "Execute one ready wave of the current plan using bounded rpi child processes. Call superagent_plan(action=set) first. All pending nodes whose dependencies are done at wave start run in batches up to maxParallel; newly unblocked nodes wait for the next call. Overlapping dispatch/edit calls are rejected. Inspect results and acceptance checks before the next wave; failed dependencies cause skipped nodes, and retries require explicit plan(update, reset). Shared files are not isolated: parallelize only independent work. Returns bounded per-node summaries and the updated graph.",
         _ => unreachable!("unknown superagent tool"),
     };
@@ -101,6 +102,13 @@ mod tests {
             assert!(schema["properties"].is_object());
         }
         assert_eq!(registered("superagent_delegate")["required"], json!(["task"]));
+        // The node schema has to offer `isolation`, or the model has no way to
+        // ask for an isolated working directory.
+        let node = &registered("superagent_plan")["properties"]["nodes"]["items"];
+        assert!(
+            node["properties"]["isolation"].is_object(),
+            "the node schema must offer isolation: {node}"
+        );
         let parallel = &registered("superagent_dispatch")["properties"]["maxParallel"];
         assert_eq!(
             (
