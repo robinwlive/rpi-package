@@ -121,7 +121,6 @@ Channel output rules:
 // Reuse the SDK's host-context lifetime and thread-safety contract.
 type StartupContext = PluginApi;
 
-static HOST_RUNTIME: OnceLock<StartupContext> = OnceLock::new();
 static PRINT_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 static AUTO_REPLY_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_PROGRESS: Mutex<Option<Arc<ReplyProgress>>> = Mutex::new(None);
@@ -1857,7 +1856,6 @@ rpi_plugin_sdk::export_plugin!(|api| {
             StbStringRef::from_str("Select the rpi-im-message profile for headless startup"),
         );
         let context = Box::new(*api);
-        let _ = HOST_RUNTIME.set(*context);
         let context = Box::leak(context);
         if let Ok(value) = cli_flag_value(context, SERVER_FLAG) {
             if cli_flag_enabled(&value) {

@@ -317,6 +317,10 @@ fn start_heartbeat(
         // The heartbeat carries the live children's ids, so a process that
         // starts later can find and kill children this one left behind.
         task.pids = pids.lock().map(|pids| pids.clone()).unwrap_or_default();
+        // Who started those children. A sweeper in another process has to be
+        // able to tell them from orphans: while this host is alive they are
+        // its work, not leftovers.
+        task.owner_pid = Some(std::process::id());
         if crate::task::append_task(&task).is_err() {
             return;
         }
@@ -343,6 +347,7 @@ fn record_progress(
     task.error = error;
     task.branch_id = crate::host::current_branch_id();
     task.pids = child_pids.to_vec();
+    task.owner_pid = Some(std::process::id());
     crate::task::append_task(&task)?;
     Ok(format!("task `{task_id}` → {}", stage.as_str()))
 }

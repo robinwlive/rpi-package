@@ -67,6 +67,13 @@ pub struct Task {
     /// only when the work is done. Recording the ids lets the next process
     /// find and clean them up.
     pub pids: Vec<u32>,
+    /// The host process that started those children.
+    ///
+    /// Without it a sweeper cannot tell an orphan from work that is running
+    /// right now in another host: a live task's snapshot names its children
+    /// too. The owner is what makes the difference — while it is alive the
+    /// children are its work, and only after it is gone are they orphans.
+    pub owner_pid: Option<u32>,
     /// Milliseconds since the epoch, from the host's entry timestamp.
     pub updated_at: u64,
 }
@@ -173,6 +180,7 @@ impl Task {
                 .and_then(Value::as_array)
                 .map(|pids| pids.iter().filter_map(Value::as_u64).map(|pid| pid as u32).collect())
                 .unwrap_or_default(),
+            owner_pid: value.get("ownerPid").and_then(Value::as_u64).map(|pid| pid as u32),
             updated_at: entry_timestamp
                 .or_else(|| value.get("updatedAt").and_then(Value::as_u64))
                 .unwrap_or(0),
@@ -190,6 +198,7 @@ impl Task {
             "error": self.error,
             "branchId": self.branch_id,
             "pids": self.pids,
+            "ownerPid": self.owner_pid,
             "updatedAt": self.updated_at,
         })
     }
@@ -618,6 +627,7 @@ mod tests {
     fn a_snapshot_round_trips() {
         let task = Task {
             task_id: "t1".into(),
+            owner_pid: None,
             title: Some("ship the thing".into()),
             stage: Stage::NeedsPerson,
             nodes: vec!["a".into(), "b".into()],

@@ -167,24 +167,36 @@ fn collect_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The child process ids recorded across every session.
+/// The child process ids recorded across every session, with the host that
+/// owns them.
 ///
 /// The latest snapshot of each task wins: an older one may name a child that
 /// has since finished, and the reaper checks liveness anyway.
-fn recorded_pids() -> Vec<u32> {
+///
+/// The owner is what separates an orphan from work in progress. A running
+/// task's snapshot names its children too, and those children are alive; a
+/// sweeper that only looked at liveness would kill them.
+fn recorded_pids() -> Vec<(Vec<u32>, Option<u32>)> {
+    recorded_pids_from(&session_files())
+}
+
+/// The same, over a given set of files.
+fn recorded_pids_from(files: &[PathBuf]) -> Vec<(Vec<u32>, Option<u32>)> {
     let mut by_task: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
-    for file in session_files() {
+    let mut owners: std::collections::HashMap<String, Option<u32>> =
+        std::collections::HashMap::new();
+    for file in files.iter() {
         // Two cheap checks before reading anything: a file that has not been
         // touched for hours is not running anything, and a file whose tail does
         // not mention a task holds none. Between them they keep the sweep to
         // the few files that could matter.
-        if !touched_recently(&file) {
+        if !touched_recently(file) {
             continue;
         }
-        if !tail_mentions_task(&file) {
+        if !tail_mentions_task(file) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Ok(text) = std::fs::read_to_string(file) else {
             continue;
         };
         for line in text.lines() {
@@ -216,9 +228,19 @@ fn recorded_pids() -> Vec<u32> {
                     })
                     .unwrap_or_default(),
             );
+            owners.insert(
+                task_id.to_string(),
+                data.get("ownerPid").and_then(Value::as_u64).map(|pid| pid as u32),
+            );
         }
     }
-    by_task.into_values().flatten().collect()
+    by_task
+        .into_iter()
+        .map(|(task_id, pids)| {
+            let owner = owners.get(&task_id).copied().flatten();
+            (pids, owner)
+        })
+        .collect()
 }
 
 /// Sweep the sessions and kill the orphans among them.
@@ -226,15 +248,29 @@ fn recorded_pids() -> Vec<u32> {
 /// Returns the ids it killed.
 pub fn sweep() -> Vec<u32> {
     let mut killed = Vec::new();
-    for pid in recorded_pids() {
-        if pid == std::process::id() {
-            continue;
+    for (pids, owner) in recorded_pids() {
+        // While the host that started these children is alive, they are its
+        // work — another session is running them right now. Killing them would
+        // break a dispatch that has nothing to do with this sweep.
+        //
+        // A snapshot without an owner comes from a host that did not record
+        // one. Those are treated as orphans: an unknown owner is not a reason
+        // to leave a process running forever.
+        if let Some(owner) = owner {
+            if owner != std::process::id() && super::spawn::process_is_alive(owner) {
+                continue;
+            }
         }
-        if !super::spawn::process_is_alive(pid) {
-            continue;
+        for pid in pids {
+            if pid == std::process::id() {
+                continue;
+            }
+            if !super::spawn::process_is_alive(pid) {
+                continue;
+            }
+            super::spawn::kill_process_tree(pid);
+            killed.push(pid);
         }
-        super::spawn::kill_process_tree(pid);
-        killed.push(pid);
     }
     killed
 }
@@ -244,6 +280,12 @@ pub fn sweep() -> Vec<u32> {
 /// The lock is held for as long as the descriptor is open: the kernel releases
 /// it when the holder dies, so a crashed supervisor is replaced by the next
 /// one that starts.
+///
+/// **The lock is per session directory, not global.** Each watched directory
+/// gets its own supervisor, because each is responsible for the orphans in its
+/// own directory. Two supervisors in different directories do not race — they
+/// have nothing to contend for. Two in the same directory cannot both run: the
+/// second finds the lock taken and exits.
 pub fn take_lock() -> Option<std::fs::File> {
     let session_dir = watched_dir()?;
     let lock_path = state_dir(&session_dir).join(LOCK_FILE);
@@ -483,6 +525,51 @@ mod tests {
         file.set_modified(old).unwrap();
         drop(file);
         assert!(!touched_recently(&path), "an old file must not be recent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A snapshot whose owner is alive names live work, not an orphan.
+    ///
+    /// The owner is what separates the two: a running task's snapshot lists its
+    /// children too, and those children are alive.
+    #[test]
+    fn a_live_owner_keeps_its_children() {
+        let dir = std::env::temp_dir().join(format!("rpi-superagent-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.jsonl");
+        let owner = std::process::id();
+        let entry = serde_json::json!({
+            "type": "custom",
+            "customType": "superagent-task",
+            "data": {"taskId": "t1", "pids": [owner], "ownerPid": owner}
+        });
+        std::fs::write(&file, format!("{entry}\n")).unwrap();
+
+        // This process is its own owner, so its children are its work.
+        let recorded = recorded_pids_from(&[file.clone()]);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1, Some(owner), "the owner must be recorded");
+        std::fs::remove_file(&file).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A snapshot without an owner is treated as an orphan: an unknown owner
+    /// is not a reason to leave a process running forever.
+    #[test]
+    fn a_snapshot_without_an_owner_names_orphans() {
+        let dir = std::env::temp_dir().join(format!("rpi-superagent-noowner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.jsonl");
+        let entry = serde_json::json!({
+            "type": "custom",
+            "customType": "superagent-task",
+            "data": {"taskId": "t1", "pids": [4242]}
+        });
+        std::fs::write(&file, format!("{entry}\n")).unwrap();
+        let recorded = recorded_pids_from(&[file.clone()]);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1, None, "no owner means no protection");
+        std::fs::remove_file(&file).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

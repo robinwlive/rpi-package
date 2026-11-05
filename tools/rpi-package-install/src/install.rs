@@ -343,6 +343,7 @@ mod tests {
         Extension {
             package: pkg.to_string(),
             artifact: pkg.replace('-', "_"),
+            extras: Vec::new(),
         }
     }
 

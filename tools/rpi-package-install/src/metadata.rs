@@ -242,6 +242,7 @@ mod tests {
                 } else {
                     "librpi_langfuse".into()
                 },
+                extras: Vec::new(),
             }]
         );
     }
@@ -251,6 +252,7 @@ mod tests {
         let ext = Extension {
             package: "rpi-langfuse".into(),
             artifact: "rpi_langfuse".into(),
+            extras: Vec::new(),
         };
         assert_eq!(
             ext.file_name(),

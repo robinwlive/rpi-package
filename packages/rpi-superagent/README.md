@@ -45,9 +45,7 @@ unified plugin ABI).
 | `superagent_plan` | Author or edit the task DAG: `set` replaces nodes, `update` applies `addNodes` / `removeIds` / `setDeps` / `reset` atomically, `show` inspects. |
 | `superagent_dispatch` | Run one wave: every pending node whose dependencies are done at wave start, in batches up to `maxParallel`. Newly unblocked nodes wait for the next call. |
 | `superagent_delegate` | Run one bounded task in a fresh `rpi` subprocess. Not the host-managed in-memory `delegate_task`; use that for in-process delegation on the current execution binding. |
-| `superagent_status` | Global state: Ticket distribution and Assignment load. |
-| `superagent_ticket` | Read one Ticket in detail, including its failure reason and stage. |
-| `superagent_policy` | Read or change the allowed list and admission table. |
+| `superagent_task` | Track a long task across restarts: `create` it, `update` its state, `list` them. |
 
 ## Relationship to `rpi-orchestrator`
 
@@ -70,6 +68,43 @@ unified plugin ABI).
 
 If you only need a task DAG and no domain semantics, `rpi-orchestrator` is the
 smaller package. This one is a superset of it.
+
+## The supervisor process
+
+A host that dies leaves its children running: `process_group(0)` puts them in
+their own group, so nothing signals them, and `rpi -p` writes nothing until it
+finishes. A separate `rpi-superagent-supervisor` process sweeps the session
+directory for those leftovers and kills them.
+
+It is a process rather than a thread because a thread dies with its host. It
+detaches from the session, and it holds a lock so that only one supervisor runs
+per session directory — two in the same directory would race over the same
+processes, and two in different directories have nothing to contend for.
+
+A snapshot records both the children and the host that started them, so the
+supervisor can tell an orphan from work that is running right now in another
+session. It only kills a child once its owner is gone.
+
+The sweep reads very little: a file that has not been touched for hours cannot
+be running anything, and a task snapshot is appended when the task changes, so
+the newest one is always near the end of the file.
+
+## Isolating parallel work
+
+Two nodes that share one working directory have to be given non-overlapping
+write ownership by hand — a rule the model has to remember, and a rule that is
+forgotten shows up as two nodes overwriting each other's files mid-run.
+
+A node with `isolation: true` gets a directory of its own under
+`.rpi/superagent-work/<run id>/<node id>`. Its child process runs there and
+its `expectFile` / `verify` checks run there too, so those paths are relative
+to that node's own work. The directories are removed when the wave finishes;
+the files a node produced are the run's output and stay.
+
+```json
+{"id": "a", "task": "write the report", "isolation": true,
+ "expectFile": "report.md", "verify": "test -s report.md"}
+```
 
 ## If a change seems to have no effect
 

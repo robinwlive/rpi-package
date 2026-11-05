@@ -68,12 +68,27 @@ pub fn cleanup_run(cwd: &Path, run_id: &str) {
 ///
 /// A node id comes from the model, so it can contain anything. A run id is
 /// ours, but the same rule is cheap and keeps one code path.
+///
+/// A dot is allowed so names like `report.md` survive, but a name that is
+/// *only* dots is not: `..` would step up a level and escape the directory it
+/// is supposed to stay in.
 fn sanitize(value: &str) -> String {
-    value
+    let cleaned: String = value
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .take(64)
-        .collect()
+        .collect();
+    // A name made only of dots names a directory level rather than a name.
+    if cleaned.chars().all(|c| c == '.') {
+        return String::new();
+    }
+    // A name that starts with dots could still step up: `..foo` is a name, but
+    // `..` is not, and neither is a name ending in one.
+    let trimmed = cleaned.trim_start_matches('.').trim_end_matches('.');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed.to_string()
 }
 
 /// A run id that is stable for one dispatch and different for the next.
@@ -126,6 +141,23 @@ mod tests {
         assert!(
             dir.starts_with("/w/.rpi/superagent-work"),
             "run id must not escape the root: {dir:?}"
+        );
+    }
+
+    /// `..` must not step up a level.
+    ///
+    /// The earlier test used `../../etc`, which the character filter already
+    /// caught because of the slashes — so the dot-only case was never covered.
+    #[test]
+    fn a_name_of_dots_cannot_step_up() {
+        assert!(node_dir(Path::new("/w"), "run1", "..").is_none());
+        assert!(node_dir(Path::new("/w"), "..", "n1").is_none());
+        assert!(node_dir(Path::new("/w"), "run1", "...").is_none());
+        // A name that merely starts with dots is still a name.
+        let dir = node_dir(Path::new("/w"), "run1", "..report").unwrap();
+        assert!(
+            dir.starts_with("/w/.rpi/superagent-work/run1"),
+            "got: {dir:?}"
         );
     }
 
