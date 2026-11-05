@@ -22,12 +22,45 @@ fn load(path: &Path) -> Result<Value, String> {
     Ok(value)
 }
 
-fn key(profile: &str, chat: &str) -> String {
-    format!("{profile}\n{chat}")
+fn key(profile: &str, chat: &str, topic: Option<&str>) -> String {
+    match topic {
+        Some(topic) => format!("{profile}\n{chat}\n{topic}"),
+        None => format!("{profile}\n{chat}"),
+    }
 }
 
-fn selection<'a>(value: &'a Value, profile: &str, chat: &str) -> Result<Option<&'a str>, String> {
-    let entry = &value["chats"][key(profile, chat)];
+/// The session id a conversation maps to.
+///
+/// A Feishu group can hold several **topics** (话题), and each topic is a
+/// conversation of its own: what is said in one topic has nothing to do with
+/// another. So the topic's root message id is part of the session id, and a
+/// group without topics keeps the plain one.
+pub fn topic_session_id(chat: &str, topic: Option<&str>) -> String {
+    let base = super::conversation_session_id(chat);
+    match topic {
+        Some(topic) => {
+            let suffix: String = topic
+                .chars()
+                .filter(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+                .take(32)
+                .collect();
+            if suffix.is_empty() {
+                base
+            } else {
+                format!("{base}-{suffix}")
+            }
+        }
+        None => base,
+    }
+}
+
+fn selection<'a>(
+    value: &'a Value,
+    profile: &str,
+    chat: &str,
+    topic: Option<&str>,
+) -> Result<Option<&'a str>, String> {
+    let entry = &value["chats"][key(profile, chat, topic)];
     if entry.is_null() {
         return Ok(None);
     }
@@ -37,23 +70,36 @@ fn selection<'a>(value: &'a Value, profile: &str, chat: &str) -> Result<Option<&
     let known = entry["sessions"]
         .as_array()
         .ok_or("invalid IM session list")?;
-    let base = super::conversation_session_id(chat);
-    if !(selected == base || selected.starts_with(&format!("{base}-")))
+    let base = topic_session_id(chat, topic);
+    // The session id is the base plus a suffix (`/new` appends a stamp), so it
+    // must be the base itself or the base followed by a separator. A plain
+    // prefix check would let one topic claim another's session: `root-ab`
+    // starts with `root-a`.
+    let owned = selected == base
+        || selected
+            .strip_prefix(&base)
+            .is_some_and(|rest| rest.starts_with('-'));
+    if !owned
         || !selected
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
         || !known.iter().any(|id| id.as_str() == Some(selected))
     {
-        return Err("IM session selection is not owned by this chat".into());
+        return Err("IM session selection is not owned by this conversation".into());
     }
     Ok(Some(selected))
 }
 
-pub fn selected(path: &Path, profile: &str, chat: &str) -> Result<Option<String>, String> {
+pub fn selected(
+    path: &Path,
+    profile: &str,
+    chat: &str,
+    topic: Option<&str>,
+) -> Result<Option<String>, String> {
     let _guard = STORE_LOCK
         .lock()
         .map_err(|_| "IM session store lock is poisoned")?;
-    selection(&load(path)?, profile, chat).map(|selected| selected.map(str::to_owned))
+    selection(&load(path)?, profile, chat, topic).map(|selected| selected.map(str::to_owned))
 }
 
 /// Unknown slash commands remain normal user prompts.
@@ -61,6 +107,7 @@ pub fn command(
     path: &Path,
     profile: &str,
     chat: &str,
+    topic: Option<&str>,
     text: &str,
 ) -> Option<Result<String, String>> {
     let words: Vec<_> = text.split_whitespace().collect();
@@ -68,19 +115,25 @@ pub fn command(
     if !matches!(command, "/new" | "/sessions" | "/session") {
         return None;
     }
-    Some(handle(path, profile, chat, &words))
+    Some(handle(path, profile, chat, topic, &words))
 }
 
-fn handle(path: &Path, profile: &str, chat: &str, words: &[&str]) -> Result<String, String> {
+fn handle(
+    path: &Path,
+    profile: &str,
+    chat: &str,
+    topic: Option<&str>,
+    words: &[&str],
+) -> Result<String, String> {
     let _guard = STORE_LOCK
         .lock()
         .map_err(|_| "IM session store lock is poisoned")?;
     let mut value = load(path)?;
-    let base = super::conversation_session_id(chat);
-    let current = selection(&value, profile, chat)?
+    let base = topic_session_id(chat, topic);
+    let current = selection(&value, profile, chat, topic)?
         .unwrap_or(&base)
         .to_owned();
-    let entry_key = key(profile, chat);
+    let entry_key = key(profile, chat, topic);
     if value["chats"][&entry_key].is_null() {
         value["chats"][&entry_key] = json!({"selected":base,"sessions":[base]});
     }
@@ -139,9 +192,107 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&path, b"{invalid").unwrap();
-        assert!(selected(&path, "p", "oc_a").is_err());
-        assert!(command(&path, "p", "oc_a", "/new").unwrap().is_err());
+        assert!(selected(&path, "p", "oc_a", None).is_err());
+        assert!(command(&path, "p", "oc_a", None, "/new").unwrap().is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{invalid");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// 话题是独立的会话：同一个群里两个话题不能共用一个 session，
+    /// 否则一个话题里说的话会漏到另一个话题。
+    #[test]
+    fn topics_in_one_group_are_separate_sessions() {
+        let path = std::env::temp_dir().join(format!(
+            "rpi-im-sessions-topics-{}.json",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 主群（没有话题）有自己的 session。
+        command(&path, "p", "oc_a", None, "/new").unwrap().unwrap();
+        // 话题 A 和话题 B 各自有自己的 session。
+        command(&path, "p", "oc_a", Some("root-a"), "/new")
+            .unwrap()
+            .unwrap();
+        command(&path, "p", "oc_a", Some("root-b"), "/new")
+            .unwrap()
+            .unwrap();
+        let topic_a = selected(&path, "p", "oc_a", Some("root-a")).unwrap().unwrap();
+        let topic_b = selected(&path, "p", "oc_a", Some("root-b")).unwrap().unwrap();
+        assert_ne!(topic_a, topic_b, "两个话题不能是同一个 session");
+        assert!(
+            topic_a.contains("root-a") && topic_b.contains("root-b"),
+            "session id 要带话题: {topic_a} / {topic_b}"
+        );
+        // 选中互不影响。
+        assert_eq!(
+            selected(&path, "p", "oc_a", Some("root-a")).unwrap().unwrap(),
+            topic_a
+        );
+        assert_eq!(
+            selected(&path, "p", "oc_a", Some("root-b")).unwrap().unwrap(),
+            topic_b
+        );
+        // 一个话题的 session 不能被另一个话题选中。
+        assert!(command(
+            &path,
+            "p",
+            "oc_a",
+            Some("root-b"),
+            &format!("/session {topic_a}")
+        )
+        .unwrap()
+        .is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// 话题 id 是前缀包含关系时（`root-a` 与 `root-ab`），一个话题
+    /// 不能认领另一个话题的 session —— 否则隔离就漏了。
+    #[test]
+    fn a_topic_cannot_claim_a_session_that_only_shares_its_prefix() {
+        let path = std::env::temp_dir().join(format!(
+            "rpi-im-sessions-prefix-{}.json",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        command(&path, "p", "oc_a", Some("root-ab"), "/new")
+            .unwrap()
+            .unwrap();
+        let other = selected(&path, "p", "oc_a", Some("root-ab")).unwrap().unwrap();
+        // 在 root-a 话题里选 root-ab 的 session：必须失败。
+        assert!(
+            command(&path, "p", "oc_a", Some("root-a"), &format!("/session {other}"))
+                .unwrap()
+                .is_err(),
+            "root-a 不能认领 root-ab 的 session"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// 没有话题的普通群保持原来的 session id，不被话题机制影响。
+    #[test]
+    fn a_group_without_topics_keeps_the_plain_session_id() {
+        let path = std::env::temp_dir().join(format!(
+            "rpi-im-sessions-plain-{}.json",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        command(&path, "p", "oc_a", None, "/new").unwrap().unwrap();
+        let plain = selected(&path, "p", "oc_a", None).unwrap().unwrap();
+        assert!(
+            plain.starts_with("im-feishu-oc_a"),
+            "没有话题时 session id 就是群: {plain}"
+        );
+        // 同一个群、没有话题：选中不受话题影响。
+        assert_eq!(
+            selected(&path, "p", "oc_a", None).unwrap().unwrap(),
+            plain
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -154,39 +305,39 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        assert!(selected(&path, "p", "oc_a").unwrap().is_none());
-        assert!(command(&path, "p", "oc_a", "/session")
+        assert!(selected(&path, "p", "oc_a", None).unwrap().is_none());
+        assert!(command(&path, "p", "oc_a", None, "/session")
             .unwrap()
             .unwrap()
             .contains("im-feishu-oc_a"));
-        command(&path, "p", "oc_a", "/new").unwrap().unwrap();
-        let first = selected(&path, "p", "oc_a").unwrap().unwrap();
-        command(&path, "p", "oc_a", "/new").unwrap().unwrap();
-        assert_ne!(selected(&path, "p", "oc_a").unwrap().unwrap(), first);
-        assert!(command(&path, "p", "oc_a", "/sessions")
+        command(&path, "p", "oc_a", None, "/new").unwrap().unwrap();
+        let first = selected(&path, "p", "oc_a", None).unwrap().unwrap();
+        command(&path, "p", "oc_a", None, "/new").unwrap().unwrap();
+        assert_ne!(selected(&path, "p", "oc_a", None).unwrap().unwrap(), first);
+        assert!(command(&path, "p", "oc_a", None, "/sessions")
             .unwrap()
             .unwrap()
             .contains(&first));
-        command(&path, "p", "oc_a", &format!("/session {first}"))
+        command(&path, "p", "oc_a", None, &format!("/session {first}"))
             .unwrap()
             .unwrap();
-        assert_eq!(selected(&path, "p", "oc_a").unwrap().unwrap(), first);
-        assert!(command(&path, "p", "oc_b", &format!("/session {first}"))
+        assert_eq!(selected(&path, "p", "oc_a", None).unwrap().unwrap(), first);
+        assert!(command(&path, "p", "oc_b", None, &format!("/session {first}"))
             .unwrap()
             .is_err());
-        assert!(selected(&path, "other-profile", "oc_a").unwrap().is_none());
-        command(&path, "p", "oc_a", "/session im-feishu-oc_a")
+        assert!(selected(&path, "other-profile", "oc_a", None).unwrap().is_none());
+        command(&path, "p", "oc_a", None, "/session im-feishu-oc_a")
             .unwrap()
             .unwrap();
         assert_eq!(
-            selected(&path, "p", "oc_a").unwrap().unwrap(),
+            selected(&path, "p", "oc_a", None).unwrap().unwrap(),
             "im-feishu-oc_a"
         );
-        assert!(command(&path, "p", "oc_a", "/session ../../secret")
+        assert!(command(&path, "p", "oc_a", None, "/session ../../secret")
             .unwrap()
             .is_err());
-        assert!(command(&path, "p", "oc_a", "/new extra").unwrap().is_err());
-        assert!(command(&path, "p", "oc_a", "普通消息 /new").is_none());
+        assert!(command(&path, "p", "oc_a", None, "/new extra").unwrap().is_err());
+        assert!(command(&path, "p", "oc_a", None, "普通消息 /new").is_none());
         std::fs::remove_file(path).unwrap();
     }
 }

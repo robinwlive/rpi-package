@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// The `export_plugin!` expansion exposes the raw-pointer ABI entrypoints the host
+// calls. Every other plugin crate in this workspace carries the same allow;
+//! without it clippy fails on the macro expansion alone.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use feishu_sdk::core::{noop_logger, Config, FEISHU_BASE_URL, LARK_BASE_URL};
 use feishu_sdk::event::models::MessageEvent;
@@ -708,6 +712,7 @@ async fn send_reaction(
 fn invoke_print_process(
     prompt: &str,
     conversation_id: &str,
+    topic: Option<&str>,
     selected_session: Option<&str>,
     model: Option<&str>,
     timeout: Duration,
@@ -716,9 +721,11 @@ fn invoke_print_process(
     let _guard = PRINT_PROCESS_LOCK
         .lock()
         .map_err(|_| "rpi print process lock is poisoned".to_string())?;
+    // A topic is its own conversation, so the fallback session carries it too:
+    // otherwise every topic in a group would share one session here.
     let session_id = selected_session
         .map(str::to_owned)
-        .unwrap_or_else(|| conversation_session_id(conversation_id));
+        .unwrap_or_else(|| sessions::topic_session_id(conversation_id, topic));
     let mut args = vec![
         "--print".to_owned(),
         "--mode".to_owned(),
@@ -877,6 +884,7 @@ fn auto_reply_content(text: &str) -> Value {
 fn invoke_print_with_retry(
     prompt: &str,
     conversation_id: &str,
+    topic: Option<&str>,
     selected_session: Option<&str>,
     model: Option<&str>,
     timeout: Duration,
@@ -887,6 +895,7 @@ fn invoke_print_with_retry(
         match invoke_print_process(
             prompt,
             conversation_id,
+            topic,
             selected_session,
             model,
             timeout,
@@ -967,7 +976,7 @@ impl EventHandler for MessageHandler {
                     .message
                     .mentions
                     .as_ref()
-                    .map_or(true, Vec::is_empty)
+                    .is_none_or(Vec::is_empty)
             {
                 return Ok(None);
             }
@@ -1002,6 +1011,20 @@ impl EventHandler for MessageHandler {
             let session_store_path = env::current_dir()
                 .map(|cwd| cwd.join(".rpi").join("im-sessions.json"))
                 .map_err(|error| error.to_string());
+            // The topic a message belongs to. In a Feishu topic group every
+            // topic is a conversation of its own, so the root message id is
+            // part of the session identity: two topics in one group must not
+            // share a session, or what is said in one leaks into the other.
+            // Messages in the group's main area carry no root id.
+            let topic: Option<String> = message
+                .message
+                .root_id
+                .clone()
+                .map(|root| root.trim().to_string())
+                .filter(|root| !root.is_empty());
+            // The topic travels into the reply task, so keep an owned copy.
+            let topic_for_reply = topic.clone();
+            let topic = topic.as_deref();
             if state.profile.auto_reply {
                 let mention_keys = message
                     .message
@@ -1014,7 +1037,13 @@ impl EventHandler for MessageHandler {
                 let command_text = session_command_text(&text, &mention_keys);
                 let command = match &session_store_path {
                     Ok(path) => {
-                        sessions::command(path, &state.profile.name, &chat_id, &command_text)
+                        sessions::command(
+                            path,
+                            &state.profile.name,
+                            &chat_id,
+                            topic,
+                            &command_text,
+                        )
                     }
                     Err(error)
                         if matches!(
@@ -1052,7 +1081,9 @@ impl EventHandler for MessageHandler {
 
             if state.profile.auto_reply && !text.trim().is_empty() {
                 let selected_session = match session_store_path
-                    .and_then(|path| sessions::selected(&path, &state.profile.name, &chat_id))
+                    .and_then(|path| {
+                        sessions::selected(&path, &state.profile.name, &chat_id, topic)
+                    })
                 {
                     Ok(selected) => selected,
                     Err(error) => {
@@ -1093,7 +1124,7 @@ impl EventHandler for MessageHandler {
                         // of the user's interactive host session.
                         if selected_session.is_some() {
                             return invoke_print_with_retry(
-                                &prompt, &process_conversation_id, selected_session.as_deref(),
+                                &prompt, &process_conversation_id, topic_for_reply.as_deref(), selected_session.as_deref(),
                                 process_model.as_deref(), process_timeout, progress,
                             );
                         }
@@ -1111,6 +1142,7 @@ impl EventHandler for MessageHandler {
                                 invoke_print_with_retry(
                                     &prompt,
                                     &process_conversation_id,
+                                    topic_for_reply.as_deref(),
                                     None,
                                     process_model.as_deref(),
                                     process_timeout,
@@ -1183,15 +1215,11 @@ fn extract_message_text(message_type: &Option<String>, content: &str) -> String 
 
 fn session_command_text(text: &str, mention_keys: &[&str]) -> String {
     let mut command = text.trim_start();
-    loop {
-        if let Some(key) = mention_keys
-            .iter()
-            .find(|key| !key.is_empty() && command.starts_with(**key))
-        {
-            command = command[key.len()..].trim_start();
-        } else {
-            break;
-        }
+    while let Some(key) = mention_keys
+        .iter()
+        .find(|key| !key.is_empty() && command.starts_with(**key))
+    {
+        command = command[key.len()..].trim_start();
     }
     command.trim().to_owned()
 }

@@ -187,8 +187,20 @@ first in groups when `mentionRequired` is enabled):
 | `/session` | Show the selected session ID and command help. |
 | `/session <ID>` | Switch to a full ID from `/sessions`, including the original session. |
 
+### Topics are separate conversations
+
+A Feishu group can hold several **topics** (话题), and each topic is a
+conversation of its own. The topic's root message id is therefore part of the
+session identity: a message in one topic never continues the session of
+another topic in the same group, and the two never share history. Messages in
+the group's main area carry no root id and keep the plain per-chat session.
+
+The same rule applies to the fallback child process, so a topic keeps its own
+session there too.
+
 Commands are handled locally without calling the model. Selection is scoped
-to the IM profile and chat and saved in `<working-directory>/.rpi/im-sessions.json`.
+to the IM profile, chat and topic, and saved in
+`<working-directory>/.rpi/im-sessions.json`.
 Keep the service's working directory the same when restarting to restore it.
 New session files are created by rpi on their first normal message. Switching
 affects subsequent messages; already scheduled replies retain their original
