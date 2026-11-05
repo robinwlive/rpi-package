@@ -485,7 +485,6 @@ struct RuntimeState {
     queue: Mutex<VecDeque<Value>>,
     queue_ready: Condvar,
     status: Mutex<ServerStatus>,
-    host_runtime: Option<StartupContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -506,7 +505,6 @@ impl RuntimeState {
                 last_error: None,
                 dropped: 0,
             }),
-            host_runtime: HOST_RUNTIME.get().copied(),
         }
     }
 
@@ -629,36 +627,6 @@ fn on_before_agent_start(event_json, out, _user_data) {
 }
 }
 
-fn invoke_runtime_action(
-    runtime: &StartupContext,
-    action: RuntimeActionId,
-    args: &Value,
-) -> Result<Value, String> {
-    let args_json = serde_json::to_string(args).map_err(|error| error.to_string())?;
-    let mut output = StbString::empty();
-    let result = (runtime.runtime_action)(
-        u32::from(action),
-        StbStringRef::from_str(&args_json),
-        &mut output,
-        runtime.user_data,
-    );
-    let output_text = output.to_string_lossy();
-    (runtime.free_string)(output);
-    if result != 0 {
-        if let Ok(value) = serde_json::from_str::<Value>(&output_text) {
-            if let Some(error) = value.get("error").and_then(Value::as_str) {
-                return Err(error.to_owned());
-            }
-        }
-        return Err(if output_text.is_empty() {
-            format!("runtime action {action:?} failed with status {result}")
-        } else {
-            output_text
-        });
-    }
-    serde_json::from_str(&output_text)
-        .map_err(|error| format!("runtime action returned invalid JSON: {error}"))
-}
 
 fn conversation_session_id(conversation_id: &str) -> String {
     let suffix = conversation_id
@@ -1123,10 +1091,10 @@ impl EventHandler for MessageHandler {
                         return Ok(None);
                     }
                 };
-                let Some(runtime) = state.host_runtime else {
-                    eprintln!("rpi-im-message: autoReply is enabled but the rpi runtime bridge is unavailable");
-                    return Ok(None);
-                };
+                // Every reply runs in its own child process. Injecting the
+                // message into the host's running session instead would put
+                // every topic into whatever session the host happens to have
+                // open, which is exactly what topic isolation rules out.
                 let prompt = text.clone();
                 let conversation_id = chat_id.clone();
                 let process_conversation_id = conversation_id.clone();
@@ -1151,35 +1119,15 @@ impl EventHandler for MessageHandler {
                         // Explicit IM session selection uses its own child process
                         // even when the host has a harness, avoiding a hot-switch
                         // of the user's interactive host session.
-                        if selected_session.is_some() {
-                            return invoke_print_with_retry(
-                                &prompt, &process_conversation_id, topic_for_reply.as_deref(), selected_session.as_deref(),
-                                process_model.as_deref(), process_timeout, progress,
-                            );
-                        }
-                        match invoke_runtime_action(
-                            &runtime,
-                            RuntimeActionId::SendUserMessage,
-                            &json!({"text": prompt.clone()}),
-                        ) {
-                            Ok(result) => Ok(result),
-                            Err(error) if error.contains("before harness was built") => {
-                                eprintln!(
-                                    "rpi-im-message: host harness is not ready; using rpi print fallback model={}"
-                                    , process_model.as_deref().unwrap_or("<rpi default>")
-                                );
-                                invoke_print_with_retry(
-                                    &prompt,
-                                    &process_conversation_id,
-                                    topic_for_reply.as_deref(),
-                                    None,
-                                    process_model.as_deref(),
-                                    process_timeout,
-                                    progress,
-                                )
-                            }
-                            Err(error) => Err(error),
-                        }
+                        invoke_print_with_retry(
+                            &prompt,
+                            &process_conversation_id,
+                            topic_for_reply.as_deref(),
+                            selected_session.as_deref(),
+                            process_model.as_deref(),
+                            process_timeout,
+                            progress,
+                        )
                     })
                     .await;
                     let generated = match generated {

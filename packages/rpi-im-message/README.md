@@ -150,32 +150,34 @@ Do not commit a configuration containing `appSecret` to source control.
 The Feishu app must enable bot messaging, subscribe to `im.message.receive_v1`
 over long connection, and grant the required message permissions.
 
-When `autoReply` is enabled, incoming text messages are passed to the active
-rpi Agent through the ABI v2 runtime bridge. The generated final text is sent
-back to the same Feishu conversation as an ordinary `text` message for plain
-replies, or a rich-text `post` message when Markdown formatting is detected
-(headings, emphasis, lists, code, links or tables). Automatic replies do not
-use interactive cards. Markdown is passed through without rewriting headings.
+When `autoReply` is enabled, each incoming text message is answered in its own
+`rpi --print` child process. The reply runs in the topic's own session and its
+own working directory — see [Topics are separate conversations](#topics-are-separate-conversations)
+— so two topics in one group never share context or files. Injecting the
+message into the host's running session instead would put every topic into
+whatever session the host happens to have open, which rules out that isolation.
+
+The generated final text is sent back to the same Feishu conversation as an
+ordinary `text` message for plain replies, or a rich-text `post` message when
+Markdown formatting is detected (headings, emphasis, lists, code, links or
+tables). Automatic replies do not use interactive cards. Markdown is passed
+through without rewriting headings.
 
 During automatic replies, each tool call gets its own ordinary text message.
 That message is edited when the call succeeds, fails or is interrupted. Each message
 shows the tool name, a short command/path/query preview, and running/success/
-error status. Full arguments and tool results are not posted. The host ABI
-event path and the headless JSONL child-process path both report tool progress;
+error status. Full arguments and tool results are not posted. The headless JSONL child-process path reports tool progress;
 the final assistant reply is sent separately. The bot needs permission to
 edit its own messages for tool status updates.
 
 Auto replies use a Feishu/Lark channel system prompt: the model returns only the
 user-facing text, without JSON/API envelopes or a `post`/card envelope. The
-same channel rules are applied to the ABI runtime path and to the headless
-`rpi --print` fallback. It defaults to `false`; without it,
-accepted messages are queued for `receive` (acknowledgement reactions are
-controlled separately). In headless mode,
-when the host has not built an Agent harness yet, the extension falls back to a
-bounded `rpi --print --no-extensions` child process so automatic replies still
-work without opening the TUI. The fallback uses a stable rpi session for each
-Feishu conversation and serializes model runs, preserving conversation context
-while avoiding concurrent session writes and provider rate spikes.
+same channel rules are applied to the `rpi --print` child process that produces
+every automatic reply. `autoReply` defaults to `false`; without it, accepted
+messages are queued for `receive` (acknowledgement reactions are controlled
+separately). The reply child is bounded by `autoReplyTimeoutSeconds` and uses a
+stable rpi session per topic, so a topic keeps its conversation across replies
+without concurrent writes to one session file.
 
 With `autoReply` enabled, send these commands directly to the bot (mention it
 first in groups when `mentionRequired` is enabled):
