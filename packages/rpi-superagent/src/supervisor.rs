@@ -72,13 +72,78 @@ pub fn watched_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Every session file under the watched directory.
+/// Every session file under the watched directory that could hold a task.
 fn session_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Some(dir) = watched_dir() {
         collect_jsonl(&dir, 0, &mut files);
     }
     files
+}
+
+/// How much of a file's tail is read when looking for task snapshots.
+const TAIL_BYTES: u64 = 64 * 1024;
+
+/// How recently a file must have been touched for its tail to be worth reading.
+///
+/// A session that has not been touched for hours is not running anything, so
+/// its tasks cannot be orphaned by a host that just died. The window is
+/// generous because the heartbeat that keeps a live session's file fresh runs
+/// once a minute, and a file's mtime moves for other reasons too.
+const RECENT_SECS: u64 = 6 * 3600;
+
+/// Whether a file was touched recently enough to be worth reading.
+fn touched_recently(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(age) = modified.elapsed() else {
+        return false;
+    };
+    age.as_secs() <= RECENT_SECS
+}
+
+/// Whether a file's tail mentions a task snapshot.
+///
+/// The supervisor looks at every session file, and most of them hold no task
+/// at all — reading them whole costs hundreds of megabytes per sweep for
+/// nothing. A snapshot is appended when a task changes, so the newest one is
+/// always near the end: the tail is enough to tell whether the file is worth
+/// reading in full.
+///
+/// A file whose tail does not mention a task is not read further. That can miss
+/// a task whose every snapshot is far from the end, but the newest snapshot of
+/// a live task is by definition recent, and a task that stopped being written
+/// is no longer worth reaping.
+fn tail_mentions_task(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return false;
+    };
+    if len <= TAIL_BYTES {
+        return std::fs::read_to_string(path)
+            .map(|text| text.contains(TASK_ENTRY_TYPE))
+            .unwrap_or(false);
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    if file.seek(SeekFrom::Start(len - TAIL_BYTES)).is_err() {
+        return false;
+    }
+    let mut tail = vec![0u8; TAIL_BYTES as usize];
+    let Ok(read) = file.read(&mut tail) else {
+        return false;
+    };
+    tail.truncate(read);
+    // A snapshot line can straddle the boundary, so the search is on bytes:
+    // the type name is plain ASCII and cannot be split in a way that hides it
+    // from a substring search.
+    String::from_utf8_lossy(&tail).contains(TASK_ENTRY_TYPE)
 }
 
 /// Collect `.jsonl` files, a couple of levels down.
@@ -109,6 +174,16 @@ fn collect_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 fn recorded_pids() -> Vec<u32> {
     let mut by_task: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
     for file in session_files() {
+        // Two cheap checks before reading anything: a file that has not been
+        // touched for hours is not running anything, and a file whose tail does
+        // not mention a task holds none. Between them they keep the sweep to
+        // the few files that could matter.
+        if !touched_recently(&file) {
+            continue;
+        }
+        if !tail_mentions_task(&file) {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
@@ -391,6 +466,24 @@ mod tests {
     fn the_state_dir_sits_beside_the_session_dir() {
         let dir = Path::new("/tmp/agent/sessions");
         assert_eq!(state_dir(dir), Path::new("/tmp/agent"));
+    }
+
+    /// A file that has not been touched for hours cannot be running anything,
+    /// so it is not worth reading.
+    #[test]
+    fn an_old_file_is_not_worth_reading() {
+        let dir = std::env::temp_dir().join(format!("rpi-superagent-age-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.jsonl");
+        std::fs::write(&path, "{\"customType\":\"superagent-task\"}\n").unwrap();
+        assert!(touched_recently(&path), "a file just written is recent");
+        // Backdate it well past the window.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(RECENT_SECS + 3600);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+        assert!(!touched_recently(&path), "an old file must not be recent");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

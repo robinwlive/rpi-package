@@ -261,7 +261,7 @@ may ignore the query and return the unfiltered branch instead.」
    这是 A' 相对独立文件的**真实代价**，且比「换 session」更常见。
 3. **跨 session**：Task 活得比 session 长时，A' 存不到别的 session 里。
 
-#### ⚠️ branch 语义（实测补充，M1 的第二个待验证项）
+#### ⚠️ branch 语义（实测补充，M1 已完成）
 
 实测确认 `AppendEntry` 返回 `scopedAppend: true`，且 `append_custom_entry`
 （`agent_harness.rs:2186`）走 `message_writes` 锁追加到**当前 leaf**。
@@ -512,10 +512,10 @@ Task（长任务单元）          ← 新的唯一领域概念
 | 1 | **没有目标陈述导致做到 60% 不知是否继续** | ~~高~~ | ✅ 已修：§1 的五条可检验陈述 + §1.4 的四条成功标准 |
 | 2 | **规模被严重低估**（6 阶段 vs 12,390 行） | ~~高~~ | ✅ 已修：§1.6 砍掉 Eval/Mandate，§3.2 重估为 1,500~2,500 行 |
 | 3 | **`Node → Ticket` 是错误技术路径** | ~~高~~ | ✅ 已修：§3.1 改为 Task 独立模块，Node 退化为 Assignment |
-| 4 | **缺决策闸门** | ~~高~~ | ✅ 已修：G0/G2/G3 已决，G1 待决且已指明前置 |
+| 4 | **缺决策闸门** | ~~高~~ | ✅ 已修：G0/G2/G3 已决，G1 也已定案（A' 方案，见 §2） |
 | 5 | 漏读 `rpi-im-message` 导致重复造 Source | ~~中~~ | ✅ 已修：§4 已读，Source 层缩到 200~300 行 |
 | 6 | 漏读 Dash 的 `classify` 导致重造 Panel 状态映射 | ~~中~~ | ✅ 已修：Dash `Bucket`（Error/Review/Question/Answered/Draft/Running/Waiting/Normal）与 Ticket stage 高度同构，直接映射 |
-| 7 | 持久化方案未定 | 中 | G1 待决，前置是读 `rpi-durable` |
+| 7 | ~~持久化方案未定~~ | ~~中~~ | ✅ 已修：**A' 方案**（AppendEntry + GetSessionBranch 快照），已实现并实测 |
 | 8 | 跨重启的任务恢复边界未定 | 中 | 读 `rpi-harness/runtime.rs` |
 | 9 | autoReply 兜底路径无 DAG 能力 | 低 | 文档说明；生产用 ABI 路径 |
 | 10 | 宿主持久化后 Ticket 与 Session 生命周期错配 | 中 | 阶段 A 一并验证 |
@@ -619,6 +619,37 @@ Task（长任务单元）          ← 新的唯一领域概念
 所以 print 子进程可以用 `-e <superagent.dylib> --local-only`：
 只加载 superagent（不递归），工具可用，话题隔离也生效。
 **代价**：im-message 必须知道 superagent 的 dylib 路径。
+
+**supervisor 的扫描成本（实测 + 优化）**
+
+审计实测：supervisor 每 5 分钟**读全部会话文件**——本机 118 个文件 / 216 MB / 0.50s，
+**每天约 6 分钟 CPU**。这是常驻成本。
+
+**优化（已实现）**：两道廉价判据挡在全文读取之前：
+
+| 判据 | 作用 | 实测 |
+| --- | --- | --- |
+| **mtime 粗筛** | 几小时没动过的会话不可能在跑什么 | 118 → 4 个文件（0.000s） |
+| **尾部 64KB 确认** | 快照是 append 的，最新的一定在尾部 | 4 → 2 个文件（0.000s） |
+
+**结果**：单次扫描 **0.50s → 0.001s**，每天 CPU **6 分钟 → 0.01 分钟**，读取量 **216 MB → 11.4 MB**。
+
+**为什么 mtime 判据成立**（实测验证）：
+
+dispatch 运行期间的**心跳快照（每 60 秒一条）会 append 到会话文件**，
+所以**文件 mtime 会随之更新**。实测：
+
+```
+   4s   变了     9119    ← 建任务 + dispatch 开始
+  64s   变了     9515    ← 心跳
+```
+
+⚠️ **但心跳的前提是有 taskId**：没有绑定任务时 dispatch 不会写快照，
+会话文件 mtime 在整个 dispatch 期间**一次都不变**（实测 130 秒 0 次更新）。
+
+**因此**：要么始终给 plan 绑 taskId（推荐），要么 supervisor 的 mtime 窗口要放宽。
+当前窗口是 **6 小时**（`RECENT_SECS`），远大于心跳间隔，也远大于「宿主崩溃到孤儿
+需要被清理」的合理时延。
 
 **M6 的关键教训：同名工具 first-wins，测试可能用错版本**
 
