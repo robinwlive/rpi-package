@@ -405,7 +405,7 @@ Task（长任务单元）          ← 新的唯一领域概念
 | **M2** | ✅ **已完成**：心跳 + 僵死任务标记 `abandoned` + **孤儿子进程清理（独立守护进程）** | 重启后没有「永远 running」的任务，也没有残留进程 | ~600 |
 | **M3** | ✅ **已完成（分发）**：`catalog/packages.json` + 打包工具支持 `[[bin]]` 附属文件 | `rpi install rpi-superagent` 能装，守护进程跟着装 | ~80 |
 | **M4** | ✅ **已完成（面板）**：Dash 读 `superagent-task` 快照，药丸显示任务状态 | **「你能看到它」兑现了** | ~200（跨仓库） |
-| **M5** | 飞书桥接：一条消息 → 自动开任务 | 飞书一条消息 → 自动开任务 → 回报 | ~500 |
+| **M5** | ✅ **已完成（飞书桥接）**：话题 = 独立主会话，回复走独立进程 + `--local-only` 只加载 superagent | 飞书一条消息 → 独立会话里建任务、编排、写文件，多个话题互不干扰 | ~250（跨包） |
 | **M6** | worktree 隔离 + 打磨 | 并行写安全 | ~300 |
 
 **M1 是第一个「能回答问题」的里程碑**——它把原 A 的一小部分和原 B 的核心合在一起。
@@ -594,6 +594,31 @@ Task（长任务单元）          ← 新的唯一领域概念
   - **修掉一个自己引入的 bug**：`reap_orphans` 会杀掉**本进程正在跑的子进程**
     （宿主可能并行调用 `list` 和 `dispatch`）→ 加「本进程拥有的 pid」白名单，
     测试抓到 `OnceLock` 未初始化导致白名单完全失效 ✅
+
+**M5 已完成**（详见下文「M5 的关键约束」）：全部回复走 `rpi --print`，
+`--local-only -e <superagent.dylib>` 只加载编排工具；话题按 `root_id` 分会话、
+分工作目录；不加载 im-message 自己（防递归）。
+
+**M5 的关键约束（实测得出，会影响设计）**
+
+飞书消息有两条投递路径，各有不可兼得的取舍：
+
+| | `SendUserMessage`（宿主有 harness 时） | `rpi --print`（兜底 / 显式 `/session`） |
+| --- | --- | --- |
+| 注入哪 | **宿主当前会话**的 main lane | 独立会话（带话题） |
+| superagent 工具 | ✅ 可用 | ❌ 不可用（`--no-extensions`） |
+| 话题隔离 | ❌ **不生效** | ✅ 生效 |
+
+**为什么 print 路径不能加载扩展**：`--no-extensions` 是防递归的——
+子进程若加载了 `rpi-im-message` 自己，会再起一个飞书长连接，收到消息又 spawn 子进程。
+
+**但有一条两全的路**（已核实）：`--local-only` = 「只加载显式 `-e` 指定的扩展」。
+`load_extensions_from_dirs` 在 `--local-only` 时 dirs 为空，但 `args.extension`
+仍会传给 `load_session_mixed_guarded`（`session.rs:2726`）。
+
+所以 print 子进程可以用 `-e <superagent.dylib> --local-only`：
+只加载 superagent（不递归），工具可用，话题隔离也生效。
+**代价**：im-message 必须知道 superagent 的 dylib 路径。
 
 **下一步（M5：飞书桥接）**
 
