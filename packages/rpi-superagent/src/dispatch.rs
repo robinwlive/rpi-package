@@ -414,7 +414,11 @@ pub(super) fn run_wave(
                             }
                             remember_child(pid);
                         };
-                        spawn::run_with_exe_reporting(
+                        // A named session resumes that worker; its directory is
+                        // passed explicitly so worker history never lands in the
+                        // user's repository.
+                        let session_dir = crate::workspace::session_dir();
+                        spawn::run_child_reporting(
                             &exe,
                             &node.task,
                             node.max_turns,
@@ -423,6 +427,8 @@ pub(super) fn run_wave(
                             selection.model(),
                             &control,
                             node_dir.as_deref(),
+                            node.session.as_deref(),
+                            session_dir.as_deref(),
                             &mut on_started,
                         )
                     });

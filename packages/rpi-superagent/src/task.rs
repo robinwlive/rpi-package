@@ -651,6 +651,7 @@ mod tests {
             model: None,
             expect_file: None,
             verify: None,
+            session: None,
             max_turns: 1,
             timeout_secs: 10,
             status,

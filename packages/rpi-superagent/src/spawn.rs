@@ -41,7 +41,8 @@ pub const SUBAGENT_ENV: &str = "RPI_SUPERAGENT_SUBAGENT";
 pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
 
 /// Build the child command. Separate from `run` so it is unit-testable without
-/// spawning anything.
+/// [`child_command_with_session`] for an ephemeral delegation — no saved
+/// session, nothing to resume.
 ///
 /// `provider` / `model` are passed through as `--provider` / `--model`. The child
 /// shares the orchestrator's agent dir but not its binding, so without them it
@@ -49,6 +50,7 @@ pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
 /// whenever this session runs on anything else, or on a provider the default does
 /// not authenticate. Callers therefore resolve the effective pair from
 /// [`crate::host::parent_selection`] first and always pass it down.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn child_command(
     exe: &Path,
     max_turns: u64,
@@ -56,13 +58,141 @@ pub fn child_command(
     model: Option<&str>,
     cwd: Option<&Path>,
 ) -> Command {
+    child_command_with_session(exe, max_turns, provider, model, cwd, None, None)
+}
+
+/// The saved session id matching `name`, if one was already created.
+///
+/// The host's `--session` **only resumes an existing session**; it refuses a
+/// name it has never seen. A worker is created once with `--name` and every
+/// later delegation resumes it by the id found here.
+///
+/// Sessions live in `<session_dir>/<cwd hash>/<timestamp>_<id>.jsonl`, and the
+/// id is the file's first line while the name is a `fact` entry inside it. Both
+/// are read rather than guessed, so a worker whose session was deleted simply
+/// gets a new one.
+pub fn find_session_id(session_dir: &Path, name: &str) -> Option<String> {
+    let stack = [session_dir.to_path_buf()];
+    let mut pending = std::collections::VecDeque::from(stack);
+    // Bounded: a session directory holds at most a few thousand files, and a
+    // symlink loop would otherwise spin forever.
+    let mut budget = 10_000usize;
+    while let Some(dir) = pending.pop_front() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push_back(path);
+                continue;
+            }
+            if !path.to_string_lossy().ends_with(".jsonl")
+                || path.to_string_lossy().ends_with(".progress.jsonl")
+            {
+                continue;
+            }
+            if let Some(id) = session_id_if_named(&path, name) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// The id of the session in `path`, if its name is `name`.
+///
+/// Line one is the header and carries the id; the name is an early `fact`
+/// entry. A bounded scan keeps a long session from being read to the end, and
+/// a file whose name never appears is not this session.
+fn session_id_if_named(path: &Path, name: &str) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut id = None;
+    let mut matched = false;
+    for line in reader.lines().take(64) {
+        let line = line.ok()?;
+        let value: serde_json::Value = serde_json::from_str(&line).ok()?;
+        if id.is_none() {
+            id = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+        }
+        if value.get("kind").and_then(serde_json::Value::as_str) == Some("fact")
+            && value.get("fact").and_then(serde_json::Value::as_str) == Some("name")
+        {
+            if value.get("name").and_then(serde_json::Value::as_str) != Some(name) {
+                return None;
+            }
+            matched = true;
+            break;
+        }
+    }
+    // A session with no name fact belongs to nobody, so it is not a match.
+    if !matched {
+        return None;
+    }
+    id
+}
+
+/// [`child_command`] with a choice of session handling.
+///
+/// `session` names the worker's saved session. The host refuses `--session` for
+/// a name it has not seen, so this looks the name up first: a session that
+/// exists is **resumed** by id, and a new one is **created** by name. Either
+/// way the worker keeps its history across delegations, which is what lets a
+/// Ticket be continued instead of rebuilt — DeepSeek's prototype does the same
+/// (`worker-<ticket id>`, `src/executor/dsh.ts`).
+///
+/// `session_dir` says where saved sessions live. It is passed explicitly rather
+/// than left to the default because the host's default is the *parent's project*
+/// `.rpi/sessions/`, and a worker would then leave its history in the user's
+/// repository.
+///
+/// With `session` unset the child stays ephemeral (`--no-session`), which is the
+/// old behaviour: one delegation, nothing written.
+///
+/// The saved-session cost is small — a measured 20-message session is 6.9 KB, not
+/// the ~2 MB an earlier note in this file guessed. A host opens one session for a
+/// Ticket, not one per delegation.
+pub fn child_command_with_session(
+    exe: &Path,
+    max_turns: u64,
+    provider: Option<&str>,
+    model: Option<&str>,
+    cwd: Option<&Path>,
+    session: Option<&str>,
+    session_dir: Option<&Path>,
+) -> Command {
     let mut command = Command::new(exe);
+    command.arg("-p");
+    match session.filter(|value| !value.is_empty()) {
+        Some(session) => {
+            if let Some(dir) = session_dir {
+                command.arg("--session-dir").arg(dir);
+                // Resume when the name is known, create when it is not. The
+                // host refuses `--session` for an unknown name, so this is a
+                // lookup, not a fallback.
+                match find_session_id(dir, session) {
+                    Some(id) => command.arg("--session").arg(id),
+                    None => command.arg("--name").arg(session),
+                };
+            } else {
+                // No directory to search: the name cannot be resolved, so it is
+                // used as a name (create).
+                command.arg("--name").arg(session);
+            }
+        }
+        // Ephemeral: one delegation, no saved history.
+        None => {
+            command.arg("--no-session");
+        }
+    }
     command
-        .arg("-p")
-        // Ephemeral session: a one-shot worker has nothing to resume, and its
-        // session file would otherwise be written into the parent's project
-        // `.rpi/sessions/` directory — one ~2 MB file per delegation.
-        .arg("--no-session")
         // Recursion guard: the child must not offer `subagent`/`plan`/`dispatch`.
         .arg("--exclude-tools")
         .arg(EXCLUDED_TOOLS);
@@ -209,11 +339,42 @@ pub fn run_with_exe_reporting(
     cwd: Option<&Path>,
     on_started: &mut dyn FnMut(u32),
 ) -> Result<String, String> {
+    run_child_reporting(
+        exe, task, max_turns, timeout_secs, provider, model, control, cwd, None, None, on_started,
+    )
+}
+
+/// [`run_with_exe_reporting`] with a choice of saved session.
+///
+/// `session` names the worker's session, so the next call with the same name
+/// resumes it; `session_dir` says where those sessions live. Both unset keeps
+/// the child ephemeral.
+#[allow(clippy::too_many_arguments)]
+pub fn run_child_reporting(
+    exe: &Path,
+    task: &str,
+    max_turns: u64,
+    timeout_secs: u64,
+    provider: Option<&str>,
+    model: Option<&str>,
+    control: &Control,
+    cwd: Option<&Path>,
+    session: Option<&str>,
+    session_dir: Option<&Path>,
+    on_started: &mut dyn FnMut(u32),
+) -> Result<String, String> {
     // Fail before launching anything if already cancelled.
     control.check()?;
-    let (mut child, tree) =
-        spawn_command(&mut child_command(exe, max_turns, provider, model, cwd))
-            .map_err(|err| format!("failed to start subagent `{}`: {err}", exe.display()))?;
+    let (mut child, tree) = spawn_command(&mut child_command_with_session(
+        exe,
+        max_turns,
+        provider,
+        model,
+        cwd,
+        session,
+        session_dir,
+    ))
+    .map_err(|err| format!("failed to start subagent `{}`: {err}", exe.display()))?;
     on_started(child.id());
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -444,6 +605,18 @@ mod tests {
 
     static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A fresh directory under the system temp dir, holding sessions for one
+    /// test. Named per test so two runs do not share one.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-superagent-sessions-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn collect_after_parent_exit(cancel: bool) {
         let _serial = PROCESS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let pid_file = std::env::temp_dir().join(format!(
@@ -641,6 +814,129 @@ mod tests {
                 (MAX_TURNS_ENV.to_string(), "7".to_string()),
                 (SUBAGENT_ENV.to_string(), "1".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_session_name_is_created_rather_than_resumed() {
+        // The host refuses `--session` for a name it has never seen, so a new
+        // worker must be created with `--name`; its history still lands in the
+        // worker's own directory, not the user's repository.
+        let dir = scratch_dir("unknown-session");
+        let command = child_command_with_session(
+            Path::new("/usr/bin/rpi"),
+            5,
+            None,
+            None,
+            None,
+            Some("worker-t1"),
+            Some(&dir),
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "--session-dir",
+                dir.to_str().unwrap(),
+                "--name",
+                "worker-t1",
+                "--exclude-tools",
+                EXCLUDED_TOOLS,
+            ]
+        );
+        // The two modes are exclusive: naming a session must not also ask for an
+        // ephemeral one, which the host would refuse.
+        assert!(!args.iter().any(|arg| arg == "--no-session"));
+    }
+
+    #[test]
+    fn a_known_session_name_is_resumed_by_id() {
+        // Once the session exists, the next delegation resumes it by id — that
+        // is what keeps a worker's history across turns.
+        let dir = scratch_dir("known-session");
+        let nested = dir.join("--project--");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("2026-01-01T00-00-00-000Z_abc.jsonl"),
+            concat!(
+                r#"{"kind":"header","id":"abc-123","cwd":"/p"}"#,
+                "\n",
+                r#"{"kind":"fact","seq":1,"fact":"name","name":"worker-t1"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        // The progress file beside it must not be mistaken for a session.
+        std::fs::write(nested.join("2026-01-01T00-00-00-000Z_abc.jsonl.progress.jsonl"), "").unwrap();
+
+        let command = child_command_with_session(
+            Path::new("/usr/bin/rpi"),
+            5,
+            None,
+            None,
+            None,
+            Some("worker-t1"),
+            Some(&dir),
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "--session-dir",
+                dir.to_str().unwrap(),
+                "--session",
+                "abc-123",
+                "--exclude-tools",
+                EXCLUDED_TOOLS,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_without_the_name_is_not_resumed() {
+        // Another worker's session must not be adopted just because the
+        // directory exists.
+        let dir = scratch_dir("other-session");
+        std::fs::write(
+            dir.join("2026-01-01T00-00-00-000Z_other.jsonl"),
+            concat!(
+                r#"{"kind":"header","id":"other-id","cwd":"/p"}"#,
+                "\n",
+                r#"{"kind":"fact","seq":1,"fact":"name","name":"someone-else"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(find_session_id(&dir, "worker-t1"), None);
+    }
+
+    #[test]
+    fn an_empty_session_name_stays_ephemeral() {
+        // Callers pass "" for "no session"; that must not become `--session`.
+        let command = child_command_with_session(
+            Path::new("/usr/bin/rpi"),
+            5,
+            None,
+            None,
+            None,
+            Some(""),
+            None,
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["-p", "--no-session", "--exclude-tools", EXCLUDED_TOOLS]
         );
     }
 

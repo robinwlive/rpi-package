@@ -57,6 +57,15 @@ pub struct Node {
     pub expect_file: Option<String>,
     /// After the child exits successfully, this shell command must exit 0.
     pub verify: Option<String>,
+    /// The saved session the node's worker works in.
+    ///
+    /// Naming one makes a later node with the same name **resume** that worker:
+    /// its history, and what it already learned about the repository, survive an
+    /// earlier turn. Without it every node starts from nothing.
+    ///
+    /// The host allows one `rpi` process per session file, so a name also keeps
+    /// two nodes from working the same session at once.
+    pub session: Option<String>,
     pub max_turns: u64,
     pub timeout_secs: u64,
     pub status: Status,
@@ -102,6 +111,7 @@ impl Node {
         let model = string_field(value, "model");
         let expect_file = string_field(value, "expectFile");
         let verify = string_field(value, "verify");
+        let session = string_field(value, "session");
         let isolation = value
             .get("isolation")
             .and_then(Value::as_bool)
@@ -128,6 +138,7 @@ impl Node {
             isolation,
             expect_file,
             verify,
+            session,
             max_turns,
             timeout_secs,
             status: Status::Pending,
@@ -147,6 +158,7 @@ impl Node {
             "isolation": self.isolation,
             "expectFile": self.expect_file,
             "verify": self.verify,
+            "session": self.session,
             "maxTurns": self.max_turns,
             "timeoutSeconds": self.timeout_secs,
             "status": self.status.as_str(),
@@ -464,9 +476,31 @@ mod tests {
         assert_eq!(details["nodes"][0]["isolation"], json!(true));
     }
 
+    /// A node that names a session keeps the name, and it survives the round
+    /// trip to `to_details`, so a later node with the same name resumes that
+    /// worker instead of starting from nothing.
     #[test]
-    fn ready_set_respects_dependencies() {
-        let mut g = graph(json!([
+    fn a_node_keeps_its_session_name() {
+        let g = graph(json!([
+            {"id": "a", "task": "x", "session": "worker-a"},
+            {"id": "b", "task": "y"}
+        ]));
+        assert_eq!(
+            g.get("a").unwrap().session.as_deref(),
+            Some("worker-a"),
+            "session must survive parsing"
+        );
+        assert_eq!(
+            g.get("b").unwrap().session, None,
+            "session defaults to unset"
+        );
+        let details = g.to_details();
+        assert_eq!(details["nodes"][0]["session"], json!("worker-a"));
+        assert_eq!(details["nodes"][1]["session"], json!(null));
+    }
+
+    #[test]
+    fn ready_set_respects_dependencies() {        let mut g = graph(json!([
             {"id": "a", "task": "x"},
             {"id": "b", "task": "y"},
             {"id": "c", "task": "z", "deps": ["a", "b"]}

@@ -26,6 +26,25 @@ use std::path::{Path, PathBuf};
 /// The directory that holds every run's working directories.
 const ROOT: &str = ".rpi/superagent-work";
 
+/// The directory that holds workers' saved sessions.
+const SESSION_ROOT: &str = ".rpi/superagent-sessions";
+
+/// Where a worker's saved session lives.
+///
+/// Passed to the child explicitly because the host's default would be the
+/// parent project's `.rpi/sessions/`, mixing worker history into the user's
+/// repository. One directory here holds every worker's session; each session
+/// is named after the node or Ticket that owns it, so no two share a file.
+///
+/// Returns `None` when there is no usable working directory; the caller then
+/// leaves the child ephemeral.
+pub fn session_dir() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let dir = cwd.join(SESSION_ROOT);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 /// The directory a node works in, if it asked for isolation.
 ///
 /// `None` means the node shares the process's working directory.
