@@ -27,9 +27,12 @@
 mod control;
 mod guide;
 mod dispatch;
+mod effects;
+mod effects_handler;
 mod graph;
 mod host;
 mod kit;
+mod passes;
 mod plan;
 mod spawn;
 mod subagent;
@@ -61,6 +64,47 @@ static GRAPH: OnceLock<Mutex<GraphState>> = OnceLock::new();
 fn graph_state() -> &'static Mutex<GraphState> {
     GRAPH.get_or_init(|| Mutex::new(GraphState::default()))
 }
+
+/// Whether any node of the shared graph is running right now.
+///
+/// A background pass asks this before starting a wave: a second wave over the
+/// same graph would run nodes the first wave already marked running. It is
+/// treated as "try later", never as a failure.
+pub(crate) fn graph_state_is_running() -> bool {
+    graph_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .is_running()
+}
+
+/// The task id the shared graph belongs to, when it names one.
+pub(crate) fn graph_task_id() -> Option<String> {
+    graph_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .graph
+        .task_id
+        .clone()
+}
+
+/// The process-wide effect queue.
+///
+/// One queue for the whole process rather than one per session: the effects are
+/// about work that must happen (launch a wave, relay a result), not about which
+/// conversation asked for it. A row names its task, and a task records its own
+/// session, so a relay still reaches the right place.
+static EFFECTS: OnceLock<effects::Effects> = OnceLock::new();
+
+/// The effect queue, created on first use.
+pub(crate) fn effects() -> &'static effects::Effects {
+    EFFECTS.get_or_init(effects::Effects::new)
+}
+
+/// The pass scheduler, started once per process.
+///
+/// Held in a `OnceLock` so a second plugin registration does not start a second
+/// thread over the same queue — two schedulers would race each other's rows.
+static PASSES: OnceLock<Mutex<passes::Passes>> = OnceLock::new();
 
 /// The session id the host attached to this tool call, if any.
 pub(crate) fn session_of(params: &Value) -> Option<String> {
@@ -117,6 +161,7 @@ impl GraphState {
             .expect("graph generation exhausted");
     }
 
+    /// Whether any node is running.
     pub(crate) fn is_running(&self) -> bool {
         self.graph
             .nodes
@@ -124,7 +169,8 @@ impl GraphState {
             .any(|node| node.status == graph::Status::Running)
     }
 
-    #[cfg(test)]
+    /// The graph, for reading. A queued wave reads the ready set through this
+    /// without taking the mutable borrow the tool path uses.
     pub(crate) fn graph(&self) -> &graph::Graph {
         &self.graph
     }
@@ -203,6 +249,15 @@ rpi_plugin_sdk::export_plugin!(|api| {
     // session can clean them up afterwards. The supervisor is a separate
     // process for exactly that reason.
     crate::supervisor::start_supervisor();
+
+    // The pass scheduler. A queued wave must run whether or not another tool
+    // call arrives, so it gets its own thread rather than riding the host's
+    // turn. Started once per process: a second scheduler would race the first
+    // over the same rows.
+    let _ = PASSES.set(Mutex::new(passes::Passes::start(
+        effects().clone(),
+        effects_handler::run,
+    )));
 
 
     if let Some(register_prompt) = api.register_before_agent_start {

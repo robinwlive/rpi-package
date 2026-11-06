@@ -28,6 +28,18 @@ const GET_EXECUTION_CONTEXT: u32 = 23;
 /// ABI id of `RuntimeActionId::GetSessionBranch`.
 const GET_SESSION_BRANCH: u32 = 20;
 
+/// ABI id of `RuntimeActionId::SendMessage`.
+///
+/// Not in the published SDK's enum, so it is a number here for the same reason
+/// `GET_EXECUTION_CONTEXT` is: the host routes by id, and the id predates the
+/// variant's name in this crate's SDK version.
+///
+/// The host's default behaviour is what makes this usable as a relay: an idle
+/// session appends the message, and a running turn **steers** it — the text
+/// joins the turn in progress instead of waiting for the next one. That is how a
+/// worker's report reaches the model while it is still working.
+const SEND_MESSAGE: u32 = 0;
+
 /// Process-lifetime host function pointers. Never retain a registration's
 /// `user_data`: a candidate reload may be rolled back and freed.
 #[derive(Clone, Copy)]
@@ -274,10 +286,100 @@ fn call_host(host: &RuntimeFns, handle: usize, action: u32, args: &Value) -> Res
     Ok(value)
 }
 
+/// Whether this host exits as soon as the current turn ends.
+///
+/// A one-shot `rpi -p` run is a process that ends the moment the model stops.
+/// A background thread dies with it, so a queued wave would be accepted and
+/// then never run — the worst outcome, because the caller was told the work was
+/// queued. Long-lived hosts (`--mode rpc`, the Feishu/Dash sessions) stay up and
+/// can drive the queue.
+///
+/// The plugin shares the host's process, so its own argv is the host's argv.
+/// `GetCliFlag` would be the tidier answer but a host need not implement it, and
+/// a wrong "unknown" would be read as "long-lived" — the dangerous direction.
+/// Reading argv fails safe: an unrecognised command line is treated as one-shot,
+/// so a queued wave is refused rather than silently lost.
+pub(crate) fn host_exits_after_this_turn() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|arg| arg == flag);
+    // `--print` / `-p`: process one prompt and exit.
+    if has("--print") || has("-p") {
+        return true;
+    }
+    // `--mode rpc`, `--connect` and `--server` are long-lived by construction.
+    if has("--mode") || has("--connect") || has("--server") {
+        return false;
+    }
+    // A bare `rpi` opens the TUI, which stays up.
+    if args.is_empty() {
+        return false;
+    }
+    // Any other positional argument is a prompt, so this is a one-shot run.
+    args.iter().any(|arg| !arg.starts_with('-'))
+}
+
+/// Steer a message into the calling session.
+///
+/// This is the relay: a background pass has no caller waiting for a return
+/// value, so its result travels as a message. The host appends to an idle
+/// session and **steers** a running turn, so a report reaches the model mid-work
+/// rather than waiting for a boundary.
+///
+/// `task_id` names the work in the message text only; the host routes to the
+/// session that registered this plugin, which is the one that asked for the
+/// work.
+pub(crate) fn relay_to_session(task_id: &str, text: &str) -> Result<(), String> {
+    let body = format!("super-agent task `{task_id}`:\n{text}");
+    call_action(SEND_MESSAGE, &serde_json::json!({ "text": body }))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The decision `host_exits_after_this_turn` makes, against a given argv.
+    /// Split out so every shape can be tested without spawning an `rpi`.
+    fn exits_after_turn(args: &[&str]) -> bool {
+        let has = |flag: &str| args.iter().any(|arg| *arg == flag);
+        if has("--print") || has("-p") {
+            return true;
+        }
+        if has("--mode") || has("--connect") || has("--server") {
+            return false;
+        }
+        if args.is_empty() {
+            return false;
+        }
+        args.iter().any(|arg| !arg.starts_with('-'))
+    }
+
+    #[test]
+    fn a_print_run_is_one_shot() {
+        // The case that matters: a queued wave would be dropped here.
+        assert!(exits_after_turn(&["-p", "do the thing"]));
+        assert!(exits_after_turn(&["--print", "do the thing"]));
+        assert!(exits_after_turn(&["-p", "--local-only", "-e", "x.dylib"]));
+    }
+
+    #[test]
+    fn a_long_lived_host_is_recognised() {
+        assert!(!exits_after_turn(&["--mode", "rpc"]));
+        assert!(!exits_after_turn(&["--mode", "json"]));
+        assert!(!exits_after_turn(&["--connect", "ws://host"]));
+        assert!(!exits_after_turn(&["--server"]));
+        // A bare `rpi` opens the TUI and stays up.
+        assert!(!exits_after_turn(&[]));
+        // Options with no prompt also stay open.
+        assert!(!exits_after_turn(&["--approve"]));
+    }
+
+    #[test]
+    fn a_positional_prompt_is_one_shot() {
+        // A prompt with no -p is still a single run.
+        assert!(exits_after_turn(&["do the thing"]));
+    }
 
     #[test]
     fn reads_the_binding_the_host_reports() {

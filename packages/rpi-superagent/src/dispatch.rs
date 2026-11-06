@@ -33,6 +33,93 @@ pub fn dispatch(
     dispatch_with(params, control, progress_tx, run_wave)
 }
 
+/// Queue a wave and return immediately.
+///
+/// The tool reports which nodes it queued; the wave itself runs on the pass
+/// scheduler ([`crate::passes`]) and its outcome reaches the session as a relay
+/// message. Nothing is left waiting on the tool call.
+///
+/// A wave with no ready node is refused rather than queued: an empty launch would
+/// spin on the queue's retry budget for no reason.
+fn queue_wave(params: &Value, max_parallel: usize) -> Result<String, String> {
+    // A queued wave runs on a background thread, and a thread dies with its
+    // host. A one-shot `rpi -p` run therefore cannot honour `async`: accepting it
+    // would tell the caller the work was queued and then silently drop it, which
+    // is worse than refusing. Refuse, and say what to do instead.
+    if crate::host::host_exits_after_this_turn() {
+        return Err(
+            "async dispatch needs a host that outlives the turn: this run is one-shot \
+             (`rpi -p` or a bare prompt), so a queued wave would be dropped when it exits. \
+             Either drop `async` to run the wave inline, or run under `--mode rpc` / an \
+             interactive session, which stays up to drive the queue."
+                .into(),
+        );
+    }
+
+    let task_id = params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(crate::graph_task_id)
+        .ok_or(
+            "action=dispatch with async requires a taskId: pass plan(taskId=...) so the result \
+             has a subject to report against",
+        )?;
+
+    let ready = {
+        let guard = lock_graph(params);
+        let graph = guard.graph();
+        if graph.nodes.is_empty() {
+            return Err("no plan yet: call plan(action=set, nodes=[...]) first".into());
+        }
+        let ready = graph.ready();
+        if ready.is_empty() {
+            if graph.has_pending() {
+                return Err(format!(
+                    "no progress: no pending node is ready (blocked by unmet dependencies): {}",
+                    graph.pending_ids().join(", ")
+                ));
+            }
+            return Ok(crate::kit::result_with_details(
+                &format!("nothing left to dispatch\n\n{}", graph.render()),
+                graph.to_details(),
+            ));
+        }
+        ready
+    };
+
+    crate::effects().enqueue(crate::effects::Effect::Launch {
+        task_id: task_id.clone(),
+        nodes: ready.clone(),
+        max_parallel,
+        // Captured here because this is the last moment the host's invocation
+        // handle exists; the background pass cannot ask which model to use.
+        binding: crate::effects::Binding::from_params(params),
+        // Same reason: the graph is keyed by session, so the pass must run as
+        // this session or it would clear the plan it is meant to execute.
+        session: crate::session_of(params),
+    });
+    // Do not wait for the scheduler's tick: the caller just asked for this.
+    if let Some(passes) = crate::PASSES.get() {
+        passes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .request();
+    }
+
+    Ok(crate::kit::result_with_details(
+        &format!(
+            "queued {n} node(s) for task `{task_id}`: {ids}\n\nThe wave runs in the background; \
+             its result arrives as a message. Check it with superagent_task(action=list).",
+            n = ready.len(),
+            ids = ready.join(", ")
+        ),
+        serde_json::json!({"async": true, "taskId": task_id, "queued": ready}),
+    ))
+}
+
 pub(super) fn dispatch_with(
     params: &Value,
     control: &Control,
@@ -54,6 +141,17 @@ pub(super) fn dispatch_with(
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_MAX_PARALLEL as u64)
         .clamp(1, MAX_PARALLEL_CAP as u64) as usize;
+
+    // Queue the wave and return, when the caller asked for that. The work then
+    // runs on the pass scheduler and reports back as a relay message, which is
+    // what lets a session keep taking requests while a wave is in flight.
+    if params
+        .get("async")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return queue_wave(params, max_parallel);
+    }
 
     let mut guard = lock_graph(params);
     if guard.is_running() {
@@ -107,7 +205,24 @@ pub(super) fn dispatch_with(
     drop(guard);
     // Nodes that name neither a provider nor a model run on this session's
     // binding, exactly like a standalone `subagent` call.
-    let parent = crate::host::parent_selection(params);
+    //
+    // A background pass has no invocation handle, so it cannot ask the host; it
+    // carries the binding captured at enqueue time in `params.binding` instead.
+    // Without that a queued wave's children would resolve the *default* provider
+    // rather than the one this session runs on.
+    let parent = match params.get("binding") {
+        Some(binding) => crate::host::Selection {
+            provider: binding
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model: binding
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        },
+        None => crate::host::parent_selection(params),
+    };
     // One id for the wave, so every isolated node lands under the same run
     // directory and two waves never share one.
     let run_id = crate::workspace::run_id("wave");
