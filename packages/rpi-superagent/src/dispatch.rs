@@ -576,9 +576,18 @@ pub(super) fn run_wave(
                         // passed explicitly so worker history never lands in the
                         // user's repository.
                         let session_dir = crate::workspace::session_dir();
+                        // The task arrives as data inside a fence, so text that
+                        // reads like a command stays text. The fixed part comes
+                        // first, which is also what lets two workers share a
+                        // prefix — and the provider's cache with it.
+                        let prompt = crate::prompt::worker_prompt(
+                            &node.task,
+                            node.expect_file.as_deref(),
+                            node.verify.as_deref(),
+                        );
                         spawn::run_child_reporting(
                             &exe,
-                            &node.task,
+                            &prompt,
                             node.max_turns,
                             node.timeout_secs,
                             selection.provider(),

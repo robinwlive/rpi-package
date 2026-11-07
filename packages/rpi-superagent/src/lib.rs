@@ -36,6 +36,7 @@ mod kit;
 mod passes;
 pub mod passes_daemon;
 mod plan;
+mod prompt;
 mod spawn;
 mod subagent;
 pub mod supervisor;
