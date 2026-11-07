@@ -53,7 +53,30 @@ When to use which:
   to see what was already in flight.
 
 A node that exits 0 may still have hit its turn cap, so declare `expectFile` or
-`verify` acceptance checks and let dispatch judge the node."#;
+`verify` acceptance checks and let dispatch judge the node.
+
+## When a worker asks a question
+
+A worker runs as a one-shot `--mode rpc` child: it can ask (`UiDialog`), but
+nothing answers it while it runs. Its result will then contain a block like:
+
+    [worker asked 1 question(s), unanswered]
+    - requestId=pidingo:7 which file should I edit?
+
+That block means the node did **not** finish — it stopped to wait for an answer
+that never came. Do not assume it worked it out.
+
+**Re-dispatch that node**, and put the answer in the node's `task` text. You are
+the project manager: read the question, decide from what you already know, and
+tell the worker on the retry. Only ask your human when the answer is something
+you cannot decide — a choice that changes the goal, spends money, or deletes
+something they own.
+
+Why not answer it live: the worker waits on stdin, this dispatch call is
+synchronous, and you are the party blocked inside it. There is no "answer while
+waiting" — that is why the question comes back as a result instead of as a
+conversation. Re-dispatching costs one extra node run; waiting for a person who
+may be away for hours costs the whole task."#;
 
 const GUIDE_SECTION: &str = r#"## Super-agent orchestration
 
@@ -210,6 +233,22 @@ mod tests {
         assert!(!with_tools.contains("## Super-agent orchestration"));
         // A second injection is refused.
         assert_eq!(apply_tools_to_prompt(&with_tools), None);
+    }
+
+    /// The guidance must say what to do with an unanswered worker question.
+    ///
+    /// Without it the model reads "worker asked 1 question, unanswered" and
+    /// assumes the node is fine — so the node is recorded as failed and nobody
+    /// retries it. The answer is to re-dispatch with the answer in the task,
+    /// which is a rule the model cannot infer from the result text alone.
+    #[test]
+    fn the_guidance_says_how_to_handle_an_unanswered_question() {
+        assert!(TOOLS_SECTION.contains("unanswered"));
+        assert!(TOOLS_SECTION.contains("Re-dispatch that node"));
+        // It must also say who decides: the model first, the person only for
+        // decisions that change the goal.
+        assert!(TOOLS_SECTION.contains("You are"));
+        assert!(TOOLS_SECTION.contains("Only ask your human"));
     }
 
     #[test]
