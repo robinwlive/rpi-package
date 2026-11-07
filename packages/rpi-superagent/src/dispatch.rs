@@ -350,6 +350,42 @@ pub(super) fn dispatch_with(
     }
     graph.propagate_skips();
 
+    // One record per node, written to the **parent** session (docs/15 §3).
+    //
+    // A failure here must not fail the dispatch: the work really ran, and the
+    // graph is the authoritative account. The record is for the person who reads
+    // this session three months from now — a missing one costs history, not work.
+    //
+    // Written for failures too: a delegation log that only lists successes is the
+    // one that makes you ask "why do I remember four workers when it says two".
+    if let Some(task_id) = graph.task_id.clone() {
+        for node in &graph.nodes {
+            // Only nodes this wave actually touched. Untouched pending nodes have
+            // no result and would just be noise.
+            if node.status == Status::Pending {
+                continue;
+            }
+            let record = crate::task::NodeRecord {
+                task_id: task_id.clone(),
+                node_id: node.id.clone(),
+                session: Some(crate::workspace::engine_session_name(
+                    Some(&task_id),
+                    &node.id,
+                )),
+                task: Some(node.task.clone()),
+                status: node.status.as_str().to_string(),
+                model: node.model.clone().or_else(|| parent.model.clone()),
+                thinking: node.thinking.clone().or_else(|| parent.thinking.clone()),
+                result_digest: node.result.as_deref().map(summarize),
+                error: node.error.clone(),
+                ..crate::task::NodeRecord::default()
+            };
+            if let Err(error) = crate::task::append_node_record(&record) {
+                eprintln!("[superagent] could not record node `{}`: {error}", node.id);
+            }
+        }
+    }
+
     // Record the wave's outcome on the long task this graph belongs to, if it
     // names one. A failure to record must not fail the dispatch: the work ran,
     // and the wave's own result is the authoritative account of it. The task

@@ -37,6 +37,99 @@ use serde_json::{json, Value};
 /// The custom entry type this module owns.
 pub const TASK_ENTRY_TYPE: &str = "superagent-task";
 
+/// The custom type for **one node's** record, appended to the parent session.
+///
+/// `superagent-task` only says what stage a task is in. This says what a single
+/// worker was asked to do, what it asked, who answered, and where its full output
+/// went — the record a person reads three months later to know what happened.
+///
+/// Why it lives in the **parent** session rather than the worker's own file: the
+/// worker's file is disposable (a node's session is named after the node and never
+/// reused), while the parent is the thing a person actually reopens. A delegation
+/// log that vanishes with the worker is not a log.
+pub const NODE_ENTRY_TYPE: &str = "superagent-node";
+
+/// One node's record, as written to the parent session.
+///
+/// Kept as a single flat object (not nested task/node trees) because the reader
+/// folds these by `nodeId` the same way `superagent-task` snapshots fold by
+/// `taskId` — one shape, one fold.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct NodeRecord {
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    #[serde(rename = "nodeId")]
+    pub node_id: String,
+    /// The session the worker ran in (engine-assigned, `<taskId>-<nodeId>`).
+    #[serde(default)]
+    pub session: Option<String>,
+    /// What the node was asked to do, verbatim — the only way to know later.
+    #[serde(default)]
+    pub task: Option<String>,
+    /// Questions the worker asked, with who answered them.
+    ///
+    /// `by` is the load-bearing field: `parent` means the orchestrating model
+    /// decided on its own, `person` means it was escalated. Without it there is no
+    /// way to audit "which decisions did the agent make for me".
+    #[serde(default)]
+    pub asks: Vec<NodeAsk>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The thinking level that **actually took effect**, read back from the
+    /// worker's session. Differs from what the plan asked for when the model does
+    /// not support that level — that difference is the whole point of recording it.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(rename = "startedAt", default)]
+    pub started_at: u64,
+    #[serde(rename = "endedAt", default)]
+    pub ended_at: u64,
+    /// A short summary of what the worker produced.
+    #[serde(rename = "resultDigest", default)]
+    pub result_digest: Option<String>,
+    /// Where the full output was spilled (see `spawn::spill_output`).
+    #[serde(rename = "resultRef", default)]
+    pub result_ref: Option<String>,
+    #[serde(rename = "resultBytes", default)]
+    pub result_bytes: u64,
+    #[serde(rename = "resultTruncated", default)]
+    pub result_truncated: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// One question a worker asked, and who answered it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct NodeAsk {
+    #[serde(default)]
+    pub at: u64,
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub answer: Option<String>,
+    /// `parent` (the orchestrating model answered) or `person` (escalated).
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// Append one node record to the parent session.
+///
+/// Every node writes exactly one of these when it finishes — success or failure —
+/// so a task's delegation history is complete rather than only its successes.
+pub fn append_node_record(record: &NodeRecord) -> Result<String, String> {
+    let reply = crate::host::call_action(
+        APPEND_ENTRY,
+        &json!({"customType": NODE_ENTRY_TYPE, "data": record}),
+    )?;
+    reply
+        .get("entryId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "the host accepted the entry but returned no entryId".into())
+}
+
 /// ABI id of `RuntimeActionId::AppendEntry`.
 const APPEND_ENTRY: u32 = 2;
 /// ABI id of `RuntimeActionId::GetSessionBranch`.
@@ -845,5 +938,68 @@ mod tests {
         assert!(text.contains("[!] t1 failed"), "got: {text}");
         assert!(text.contains("build"), "got: {text}");
         assert!(text.contains("boom"), "got: {text}");
+    }
+
+    /// A node record must survive a round trip: Dash reads it back by `nodeId`.
+    ///
+    /// The field names are the contract with `pi-dingo-dash`
+    /// (`crates/core/src/sessions.rs` folds them), so a rename here silently
+    /// empties the other side rather than failing loudly.
+    #[test]
+    fn a_node_record_round_trips_through_its_wire_shape() {
+        let record = NodeRecord {
+            task_id: "T1".into(),
+            node_id: "a".into(),
+            session: Some("T1-a".into()),
+            task: Some("edit three files".into()),
+            asks: vec![NodeAsk {
+                at: 1,
+                question: "which file?".into(),
+                answer: Some("src/main.rs".into()),
+                by: Some("parent".into()),
+            }],
+            status: "done".into(),
+            model: Some("magpie/x".into()),
+            thinking: Some("off".into()),
+            started_at: 10,
+            ended_at: 20,
+            result_digest: Some("3 files".into()),
+            result_ref: Some("/Users/me/.pidd/node-output/T1/a.txt".into()),
+            result_bytes: 184320,
+            result_truncated: true,
+            error: None,
+        };
+        let json = serde_json::to_value(&record).unwrap();
+        // camelCase on the wire; the reader depends on these exact names.
+        assert_eq!(json["taskId"], "T1");
+        assert_eq!(json["nodeId"], "a");
+        assert_eq!(json["resultRef"], "/Users/me/.pidd/node-output/T1/a.txt");
+        assert_eq!(json["asks"][0]["by"], "parent");
+
+        let back: NodeRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.node_id, "a");
+        assert_eq!(back.result_bytes, 184320);
+        assert!(back.result_truncated);
+        assert_eq!(back.asks.len(), 1);
+    }
+
+    /// `by` records who answered — the only way to audit "what did the agent
+    /// decide for me". An absent value must stay absent rather than defaulting
+    /// to a plausible-looking answer.
+    #[test]
+    fn who_answered_is_preserved_or_absent() {
+        let unanswered = NodeAsk {
+            question: "q".into(),
+            ..NodeAsk::default()
+        };
+        assert_eq!(unanswered.by, None);
+        let escalated = NodeAsk {
+            question: "q".into(),
+            answer: Some("yes".into()),
+            by: Some("person".into()),
+            ..NodeAsk::default()
+        };
+        let json = serde_json::to_value(&escalated).unwrap();
+        assert_eq!(json["by"], "person");
     }
 }
