@@ -54,5 +54,13 @@ fn main() {
     // The lock lives as long as the process: the kernel releases it on exit.
     std::mem::forget(_lock);
 
+    // Said once, so "is the daemon actually running?" has an answer that does not
+    // need `ps`. Everything after this is reported only when something goes wrong:
+    // a queue that is working correctly has nothing to say.
+    eprintln!(
+        "rpi-superagent-daemon: serving {} (pid {})",
+        root.display(),
+        std::process::id()
+    );
     rpi_superagent::passes_daemon::serve(&root);
 }
