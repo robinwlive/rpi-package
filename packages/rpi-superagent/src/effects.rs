@@ -69,6 +69,12 @@ impl Later {
 pub struct Binding {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// The session's thinking level at enqueue time (`off` … `max`).
+    ///
+    /// Same reason as provider/model: the background pass cannot ask the host,
+    /// so a level not captured here is lost and the worker thinks at the
+    /// settings default.
+    pub thinking: Option<String>,
 }
 
 impl Binding {
@@ -81,12 +87,13 @@ impl Binding {
         Binding {
             provider: selection.provider,
             model: selection.model,
+            thinking: selection.thinking,
         }
     }
 
     /// Whether anything was captured.
     pub fn is_empty(&self) -> bool {
-        self.provider.is_none() && self.model.is_none()
+        self.provider.is_none() && self.model.is_none() && self.thinking.is_none()
     }
 }
 
@@ -760,6 +767,7 @@ mod tests {
             binding: Binding {
                 provider: Some("anthropic".into()),
                 model: Some("claude-sonnet-5".into()),
+                thinking: None,
             },
             session: None,
         graph: None,
@@ -798,6 +806,7 @@ mod tests {
                 binding: Binding {
                     provider: Some("anthropic".into()),
                     model: Some("claude-sonnet-5".into()),
+                    thinking: None,
                 },
                 session: Some("sess-9".into()),
             graph: None,
@@ -880,6 +889,15 @@ mod tests {
         assert!(!Binding {
             provider: Some("p".into()),
             model: None,
+            thinking: None,
+        }
+        .is_empty());
+        // A thinking level alone is a real binding: it changes how the child
+        // runs even when the model is inherited.
+        assert!(!Binding {
+            provider: None,
+            model: None,
+            thinking: Some("high".into()),
         }
         .is_empty());
     }

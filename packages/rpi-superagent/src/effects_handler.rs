@@ -106,6 +106,31 @@ fn run_launch(
             )))
         }
     };
+    // No binding and a node that names nothing means that worker resolves the
+    // *settings default* — a different model than the session that queued the
+    // wave. That is how a wave silently spends another account's quota and then
+    // fails with a rate-limit error the caller cannot explain. Refusing is the
+    // honest answer: the row cannot be repaired from here (the asking session's
+    // handle is gone), so it has to be re-queued from a session.
+    if binding.is_empty() {
+        let unbound: Vec<&str> = nodes
+            .iter()
+            .filter(|id| {
+                rebuilt.get(id).map_or(true, |node| {
+                    node.provider.is_none() && node.model.is_none()
+                })
+            })
+            .map(String::as_str)
+            .collect();
+        if !unbound.is_empty() {
+            return Err(Outcome::Failed(format!(
+                "these nodes name no provider/model and the wave recorded no binding: {}. \
+                 Their workers would fall back to the default model. Re-run dispatch from a \
+                 session.",
+                unbound.join(", ")
+            )));
+        }
+    }
     if let Err(message) = crate::install_graph(session.map(str::to_string), rebuilt) {
         return Err(Outcome::Failed(message));
     }
@@ -120,6 +145,7 @@ fn run_launch(
         "binding": {
             "provider": binding.provider,
             "model": binding.model,
+            "thinking": binding.thinking,
         },
     });
     if let Some(session) = session {

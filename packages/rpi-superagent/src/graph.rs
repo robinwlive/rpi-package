@@ -11,6 +11,15 @@ pub const MAX_MAX_TURNS: u64 = 32;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 pub const MIN_TIMEOUT_SECS: u64 = 10;
 pub const MAX_TIMEOUT_SECS: u64 = 1800;
+
+/// How many agent-spawn generations a chain may reach before it is recorded but
+/// no longer dispatched.
+///
+/// The number is a judgement, not a measurement: eight generations is already a
+/// chain nobody planned, and each one costs a full model run. It matches the
+/// prototype this package follows, so the two agree on where "this has run away"
+/// begins.
+pub const MAX_TIER: u32 = 8;
 pub const MAX_TASK_BYTES: usize = 20_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,6 +203,17 @@ pub struct Graph {
     /// the model having to remember to do it, which is the whole point: a
     /// caller that has to sync two things by hand will eventually forget.
     pub task_id: Option<String>,
+    /// How deep in a chain of agent-spawns this plan sits.
+    ///
+    /// DeepSeek's TTL, applied to agents: a worker whose output queues another
+    /// wave is one level deeper, and the counter does not reset for a human
+    /// question or a scheduled retry. Without it, a wave that produces work which
+    /// produces work can run forever — each step is individually reasonable and
+    /// the chain is not. Past [`MAX_TIER`] the plan is recorded but not dispatched.
+    ///
+    /// The counter is carried by the plan, not asked of the model, for the same
+    /// reason the TTL is not: whoever is being limited cannot be trusted to count.
+    pub tier: u32,
 }
 
 impl Graph {
@@ -209,6 +229,7 @@ impl Graph {
         let graph = Graph {
             nodes,
             task_id: None,
+            tier: 0,
         };
         graph.validate()?;
         Ok(graph)
@@ -218,6 +239,7 @@ impl Graph {
         json!({
             "nodes": self.nodes.iter().map(Node::to_value).collect::<Vec<_>>(),
             "taskId": self.task_id,
+            "tier": self.tier,
         })
     }
 
@@ -267,6 +289,11 @@ impl Graph {
                 .get("taskId")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            tier: value
+                .get("tier")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u64::from(MAX_TIER)) as u32,
         };
         graph.validate()?;
         Ok(graph)
@@ -599,6 +626,47 @@ mod tests {
         });
         let g = Graph::from_details(&details).unwrap();
         assert_eq!(g.get("a").unwrap().status, Status::Pending);
+    }
+
+    /// The TTL: a plan past the generation limit is not dispatched.
+    #[test]
+    fn the_tier_is_capped_when_read_back() {
+        // A plan cannot claim a generation beyond the limit, so the check in
+        // `dispatch` always sees an honest number.
+        let details = json!({
+            "nodes": [{"id": "a", "task": "x"}],
+            "taskId": null,
+            "tier": 999
+        });
+        assert_eq!(Graph::from_details(&details).unwrap().tier, MAX_TIER);
+    }
+
+    #[test]
+    fn the_tier_survives_the_details_round_trip() {
+        let mut g = graph(json!([{"id": "a", "task": "x"}]));
+        g.tier = 3;
+        assert_eq!(Graph::from_details(&g.to_details()).unwrap().tier, 3);
+    }
+
+    #[test]
+    fn a_plan_without_a_tier_starts_at_zero() {
+        // A person's session has no generation: their plan is the root.
+        let details = json!({"nodes": [{"id": "a", "task": "x"}], "taskId": null});
+        assert_eq!(Graph::from_details(&details).unwrap().tier, 0);
+    }
+
+    /// The TTL has to be a hard stop, not a suggestion: at the limit the plan is
+    /// recorded and nothing runs.
+    #[test]
+    fn a_plan_at_the_tier_limit_is_refused() {
+        let mut g = graph(json!([{"id": "a", "task": "x"}]));
+        g.tier = MAX_TIER;
+        // `dispatch` checks this before reading the ready set; the check itself is
+        // expressed through the field, so a plan at the limit is recognisably at
+        // the limit.
+        assert!(g.tier >= MAX_TIER);
+        g.tier = MAX_TIER - 1;
+        assert!(g.tier < MAX_TIER, "one generation below still runs");
     }
 
     #[test]

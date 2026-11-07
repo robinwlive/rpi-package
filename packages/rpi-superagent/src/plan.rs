@@ -14,6 +14,19 @@ use crate::kit::{result_with_details, Progress};
 use crate::lock_graph;
 use serde_json::Value;
 
+/// The agent-spawn generation this process was started at.
+///
+/// Read from the environment rather than from the tool arguments: the model is
+/// the party being limited, so it must not be able to say which generation it is
+/// in. A person's own session has no such variable, so their plan starts at zero.
+fn tier_from_env() -> u32 {
+    std::env::var(crate::spawn::TIER_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(crate::graph::MAX_TIER)
+}
+
 pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<String, String> {
     control.check()?;
     let action = params
@@ -37,6 +50,11 @@ pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<S
             // records that task's progress without the caller having to
             // update it by hand.
             graph.task_id = task_id_of(params);
+            // The generation comes from the environment the worker was started
+            // with, not from the arguments: a limit the limited party can pass is
+            // not a limit. A person starting a plan in their own session has no
+            // such variable, which is exactly right — that is generation zero.
+            graph.tier = tier_from_env();
         }
         "update" => {
             let mut next = graph.clone();

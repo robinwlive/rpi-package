@@ -114,6 +114,10 @@ pub enum Stored {
         provider: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        /// The session's thinking level. Defaulted so rows written by an older
+        /// version still load (they simply carry no level).
+        #[serde(default)]
+        thinking: Option<String>,
         /// The graph, so a process that never saw the plan can rebuild it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         graph: Option<serde_json::Value>,
@@ -128,6 +132,8 @@ pub enum Stored {
         provider: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        thinking: Option<String>,
     },
     Relay {
         task_id: String,
@@ -145,6 +151,7 @@ impl Stored {
                 max_parallel,
                 provider,
                 model,
+                thinking,
                 graph,
                 rpi_exe,
             } => Effect::Launch {
@@ -154,6 +161,7 @@ impl Stored {
                 binding: Binding {
                     provider: provider.clone(),
                     model: model.clone(),
+                    thinking: thinking.clone(),
                 },
                 session: None,
                 graph: graph.clone(),
@@ -164,12 +172,14 @@ impl Stored {
                 node,
                 provider,
                 model,
+                thinking,
             } => Effect::Extend {
                 task_id: task_id.clone(),
                 node: node.clone(),
                 binding: Binding {
                     provider: provider.clone(),
                     model: model.clone(),
+                    thinking: thinking.clone(),
                 },
                 session: None,
             },
@@ -197,6 +207,7 @@ impl Stored {
                 max_parallel: *max_parallel,
                 provider: binding.provider.clone(),
                 model: binding.model.clone(),
+                thinking: binding.thinking.clone(),
                 graph: graph.clone(),
                 rpi_exe: rpi_exe.clone(),
             },
@@ -210,6 +221,7 @@ impl Stored {
                 node: node.clone(),
                 provider: binding.provider.clone(),
                 model: binding.model.clone(),
+                thinking: binding.thinking.clone(),
             },
             Effect::Relay { task_id, text } => Stored::Relay {
                 task_id: task_id.clone(),
@@ -544,6 +556,7 @@ mod tests {
             binding: Binding {
                 provider: Some("anthropic".into()),
                 model: Some("claude-sonnet-5".into()),
+                thinking: None,
             },
             session: Some("sess-1".into()),
         graph: None,

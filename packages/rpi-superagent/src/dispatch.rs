@@ -175,6 +175,18 @@ pub(super) fn dispatch_with(
         return Err("no plan yet: call plan(action=set, nodes=[...]) first".into());
     }
 
+    // The TTL check. A chain of agent-spawns is capped by generation, and the
+    // count lives on the plan so the agent being limited cannot raise it.
+    if graph.tier >= crate::graph::MAX_TIER {
+        return Err(format!(
+            "this plan is at tier {}, the agent-spawn limit ({}): it was produced by a chain of \
+             agents and dispatching it again would extend the chain. The work is recorded and \
+             nothing was run. Start a fresh plan from a person's own request to continue.",
+            graph.tier,
+            crate::graph::MAX_TIER
+        ));
+    }
+
     let ready = graph.ready();
     if ready.is_empty() {
         if graph.has_pending() {
@@ -230,6 +242,10 @@ pub(super) fn dispatch_with(
                 .map(str::to_string),
             model: binding
                 .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            thinking: binding
+                .get("thinking")
                 .and_then(Value::as_str)
                 .map(str::to_string),
             exe: params
@@ -567,10 +583,14 @@ pub(super) fn run_wave(
                             node.timeout_secs,
                             selection.provider(),
                             selection.model(),
+                            selection.thinking(),
                             &control,
                             node_dir.as_deref(),
                             node.session.as_deref(),
                             session_dir.as_deref(),
+                            // One deeper than this wave: the worker's own output
+                            // belongs to the next generation.
+                            graph.tier.saturating_add(1),
                             &mut on_started,
                         )
                     });

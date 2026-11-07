@@ -24,7 +24,7 @@ use crate::control::Control;
 
 /// Tools this package registers. Excluded from the child's tool set so a
 /// subagent cannot recursively orchestrate (design §8 "递归守卫").
-pub const EXCLUDED_TOOLS: &str = "superagent_delegate,superagent_plan,superagent_dispatch";
+pub const EXCLUDED_TOOLS: &str = "superagent_delegate,superagent_dispatch,superagent_plan";
 
 /// Upper bound on the text fed back to the orchestrator (design §8 "输出截断").
 pub const MAX_OUTPUT_BYTES: usize = 40_000;
@@ -35,6 +35,19 @@ pub const MAX_TURNS_ENV: &str = "RPI_MAX_TURNS_PER_RUN";
 /// Marker set on the child so the orchestrator guidance is not injected into a
 /// subagent (which does not have `plan`/`dispatch`).
 pub const SUBAGENT_ENV: &str = "RPI_SUPERAGENT_SUBAGENT";
+
+/// Environment variable carrying the agent-spawn generation a worker runs at.
+pub const TIER_ENV: &str = "RPI_SUPERAGENT_TIER";
+
+/// The binding, duplicated as environment variables.
+///
+/// The flag path depends on a host query that can fail; `rpi` fills any absent
+/// flag from these, so one failed query no longer demotes the worker to
+/// `settings.json`'s default model. Explicit flags still win inside `rpi`.
+/// Must match `rpi-cli/src/app.rs` (ENV_PROVIDER / ENV_MODEL / ENV_THINKING).
+pub const ENV_PROVIDER: &str = "RPI_PROVIDER";
+pub const ENV_MODEL: &str = "RPI_MODEL";
+pub const ENV_THINKING: &str = "RPI_THINKING";
 
 /// How often the wait loop re-checks cancellation/timeout. Bounds how long a
 /// cancelled call can keep a child alive.
@@ -58,7 +71,7 @@ pub fn child_command(
     model: Option<&str>,
     cwd: Option<&Path>,
 ) -> Command {
-    child_command_with_session(exe, max_turns, provider, model, cwd, None, None)
+    child_command_with_session(exe, max_turns, provider, model, None, cwd, None, None, 0)
 }
 
 /// The saved session id matching `name`, if one was already created.
@@ -159,14 +172,19 @@ fn session_id_if_named(path: &Path, name: &str) -> Option<String> {
 /// The saved-session cost is small — a measured 20-message session is 6.9 KB, not
 /// the ~2 MB an earlier note in this file guessed. A host opens one session for a
 /// Ticket, not one per delegation.
+// The argument list mirrors the child's flags plus the session choice; a struct
+// would mean rewriting every caller and every test for one more field.
+#[allow(clippy::too_many_arguments)]
 pub fn child_command_with_session(
     exe: &Path,
     max_turns: u64,
     provider: Option<&str>,
     model: Option<&str>,
+    thinking: Option<&str>,
     cwd: Option<&Path>,
     session: Option<&str>,
     session_dir: Option<&Path>,
+    tier: u32,
 ) -> Command {
     let mut command = Command::new(exe);
     command.arg("-p");
@@ -202,10 +220,30 @@ pub fn child_command_with_session(
     if let Some(model) = model.filter(|value| !value.is_empty()) {
         command.arg("--model").arg(model);
     }
+    if let Some(thinking) = thinking.filter(|value| !value.is_empty()) {
+        command.arg("--thinking").arg(thinking);
+    }
+    // The flags above depend on a host query that can fail silently. Repeating
+    // the same binding as environment variables gives `rpi` a second channel, so
+    // one failed query no longer demotes the worker to settings.json's default
+    // model — a different account, and for this provider possibly an exhausted
+    // one. Explicit flags still win inside `rpi`: these are fills, not overrides.
+    if let Some(provider) = provider.filter(|value| !value.is_empty()) {
+        command.env(ENV_PROVIDER, provider);
+    }
+    if let Some(model) = model.filter(|value| !value.is_empty()) {
+        command.env(ENV_MODEL, model);
+    }
+    if let Some(thinking) = thinking.filter(|value| !value.is_empty()) {
+        command.env(ENV_THINKING, thinking);
+    }
     command
         // Hard turn ceiling enforced by the harness, not the model.
         .env(MAX_TURNS_ENV, max_turns.to_string())
         .env(SUBAGENT_ENV, "1")
+        // One deeper than the wave being run: this worker's own output, if it
+        // queues more work, belongs to the next generation.
+        .env(TIER_ENV, tier.saturating_add(1).to_string())
         // A node that asked for isolation works in its own directory, so it
         // cannot overwrite what another node is writing.
         .current_dir(cwd.unwrap_or_else(|| Path::new(".")))
@@ -233,6 +271,7 @@ pub(crate) fn failure_message(
     let selection = crate::host::Selection {
         provider: provider.map(str::to_string),
         model: model.map(str::to_string),
+        thinking: None,
         exe: None,
     };
     format!(
@@ -341,7 +380,8 @@ pub fn run_with_exe_reporting(
     on_started: &mut dyn FnMut(u32),
 ) -> Result<String, String> {
     run_child_reporting(
-        exe, task, max_turns, timeout_secs, provider, model, control, cwd, None, None, on_started,
+        exe, task, max_turns, timeout_secs, provider, model, None, control, cwd, None, None, 0,
+        on_started,
     )
 }
 
@@ -358,10 +398,12 @@ pub fn run_child_reporting(
     timeout_secs: u64,
     provider: Option<&str>,
     model: Option<&str>,
+    thinking: Option<&str>,
     control: &Control,
     cwd: Option<&Path>,
     session: Option<&str>,
     session_dir: Option<&Path>,
+    tier: u32,
     on_started: &mut dyn FnMut(u32),
 ) -> Result<String, String> {
     // Fail before launching anything if already cancelled.
@@ -371,9 +413,11 @@ pub fn run_child_reporting(
         max_turns,
         provider,
         model,
+        thinking,
         cwd,
         session,
         session_dir,
+        tier,
     ))
     .map_err(|err| format!("failed to start subagent `{}`: {err}", exe.display()))?;
     on_started(child.id());
@@ -814,6 +858,9 @@ mod tests {
             vec![
                 (MAX_TURNS_ENV.to_string(), "7".to_string()),
                 (SUBAGENT_ENV.to_string(), "1".to_string()),
+                // A plan dispatched from a person's session is generation zero, so
+                // its workers run at one.
+                (TIER_ENV.to_string(), "1".to_string()),
             ]
         );
     }
@@ -830,8 +877,10 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("worker-t1"),
             Some(&dir),
+            0,
         );
         let args: Vec<String> = command
             .get_args()
@@ -880,8 +929,10 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("worker-t1"),
             Some(&dir),
+            0,
         );
         let args: Vec<String> = command
             .get_args()
@@ -928,8 +979,10 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(""),
             None,
+            0,
         );
         let args: Vec<String> = command
             .get_args()
@@ -988,6 +1041,7 @@ mod tests {
         let parent = crate::host::Selection {
             provider: Some("routeryo-copy".into()),
             model: Some("gpt-6.1-sol".into()),
+            thinking: None,
             exe: None,
         };
         let selection = parent.effective(None, None);

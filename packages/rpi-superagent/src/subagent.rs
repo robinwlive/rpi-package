@@ -60,9 +60,10 @@ pub fn subagent(
         control,
     )?;
     Ok(content_only(&format!(
-        "[subagent role={role} turns<={max_turns} timeout={timeout_secs}s provider={} model={}]\n{output}",
+        "[subagent role={role} turns<={max_turns} timeout={timeout_secs}s provider={} model={} thinking={}]\n{output}",
         selection.provider().unwrap_or("-"),
         selection.model().unwrap_or("-"),
+        selection.thinking().unwrap_or("-"),
     )))
 }
 

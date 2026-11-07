@@ -67,6 +67,15 @@ pub(crate) fn install(plugin: &rpi_plugin_sdk::PluginApi) {
 pub(crate) struct Selection {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// The parent session's thinking level, passed down as `--thinking`.
+    ///
+    /// Carried for the same reason as the model: a child shares the agent dir
+    /// but **not** the binding, so without it a worker resolves the default
+    /// level from settings — the worker would then think at a different depth
+    /// than the session that asked for it, and the user has no way to tell.
+    /// `"off"` is a real value here (thinking turned off), not "unknown":
+    /// unknown is `None`.
+    pub thinking: Option<String>,
     /// The `rpi` executable a worker should be launched with.
     ///
     /// Carried alongside the binding because it is the same kind of fact: the
@@ -93,6 +102,9 @@ impl Selection {
             return Selection {
                 provider: explicit_provider.map(str::to_string),
                 model: explicit_model.map(str::to_string),
+                // Naming a model does not name a thinking depth: the level is
+                // still this session's own, so it is inherited.
+                thinking: self.thinking.clone(),
                 // The executable is not part of the binding choice; it travels
                 // with it so every worker of a wave uses the same one.
                 exe: self.exe.clone(),
@@ -107,6 +119,11 @@ impl Selection {
 
     pub(crate) fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    /// The `--thinking` value, if the host reported one.
+    pub(crate) fn thinking(&self) -> Option<&str> {
+        self.thinking.as_deref()
     }
 
     /// `provider/model` (or whichever half is known, or `-`) for result banners
@@ -219,6 +236,15 @@ pub(crate) fn selection_from_context(context: &Value) -> Selection {
     Selection {
         provider: field("provider"),
         model: field("id"),
+        // `thinkingLevel` sits next to `model` in the reply and is a plain
+        // lowercase level name (`off` … `max`), the same spelling the host's
+        // `--thinking` flag accepts.
+        thinking: context
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         // The host reports the binding, not the executable: this process *is*
         // an `rpi`, so `current_exe` is the right answer here.
         exe: None,
@@ -418,6 +444,7 @@ mod tests {
             Selection {
                 provider: Some("deepseek".into()),
                 model: None,
+                thinking: None,
                 exe: None,
             }
             .label(),
@@ -431,7 +458,8 @@ mod tests {
         let parent = Selection {
             provider: Some("routeryo-copy".into()),
             model: Some("gpt-6.1-sol".into()),
-                exe: None,
+            thinking: Some("high".into()),
+            exe: None,
         };
         // Nothing named: inherit the whole binding.
         assert_eq!(parent.effective(None, None), parent);
@@ -441,6 +469,7 @@ mod tests {
             Selection {
                 provider: Some("openai".into()),
                 model: Some("gpt-6-astra".into()),
+                thinking: Some("high".into()),
                 exe: None,
             }
         );
@@ -450,6 +479,7 @@ mod tests {
             Selection {
                 provider: Some("deepseek".into()),
                 model: None,
+                thinking: Some("high".into()),
                 exe: None,
             }
         );
@@ -458,6 +488,7 @@ mod tests {
             Selection {
                 provider: None,
                 model: Some("deepseek-v4-pro".into()),
+                thinking: Some("high".into()),
                 exe: None,
             }
         );
