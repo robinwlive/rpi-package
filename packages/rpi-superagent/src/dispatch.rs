@@ -42,16 +42,18 @@ pub fn dispatch(
 /// A wave with no ready node is refused rather than queued: an empty launch would
 /// spin on the queue's retry budget for no reason.
 fn queue_wave(params: &Value, max_parallel: usize) -> Result<String, String> {
-    // A queued wave runs on a background thread, and a thread dies with its
-    // host. A one-shot `rpi -p` run therefore cannot honour `async`: accepting it
-    // would tell the caller the work was queued and then silently drop it, which
-    // is worse than refusing. Refuse, and say what to do instead.
-    if crate::host::host_exits_after_this_turn() {
+    // A queued wave needs something to run it after this turn ends. Two things
+    // can: a durable log that a daemon polls, or a host that stays up.
+    //
+    // With neither, accepting the work would tell the caller it was queued and
+    // then silently drop it — worse than refusing. So: refuse, and say which of
+    // the two is missing.
+    if crate::host::host_exits_after_this_turn() && !crate::effects().is_durable() {
         return Err(
-            "async dispatch needs a host that outlives the turn: this run is one-shot \
-             (`rpi -p` or a bare prompt), so a queued wave would be dropped when it exits. \
-             Either drop `async` to run the wave inline, or run under `--mode rpc` / an \
-             interactive session, which stays up to drive the queue."
+            "async dispatch needs something to run the wave after this turn, and this run \
+             has neither: it is one-shot (`rpi -p` or a bare prompt), and the effect log is \
+             not writable. Either drop `async` to run the wave inline, or run under \
+             `--mode rpc` / an interactive session, which stays up to drive the queue."
                 .into(),
         );
     }

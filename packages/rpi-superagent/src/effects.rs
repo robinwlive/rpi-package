@@ -245,11 +245,89 @@ pub struct Effects {
     broken: Arc<Mutex<HashMap<Kind, u32>>>,
     /// The keys running right now, so one subject never runs twice at once.
     running: Arc<Mutex<Vec<(Kind, String)>>>,
+    /// Where rows are recorded, when this queue is durable.
+    ///
+    /// `None` for a queue that only lives in memory, which is what the tests use
+    /// and what a host without a working directory falls back to. With a log,
+    /// every change is appended so a restarted process resumes the queue.
+    log: Option<Arc<Mutex<crate::effects_log::Log>>>,
 }
 
 impl Effects {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A queue that records every change to `log` and starts from what it holds.
+    ///
+    /// The rows already in the log are loaded immediately, so a restarted
+    /// process picks up exactly where the last one stopped — including the
+    /// attempt counts, which is what keeps a retry budget across a restart.
+    pub fn durable(log: crate::effects_log::Log) -> Self {
+        let rows = log.load();
+        let seq = rows.iter().map(|row| row.seq).max().unwrap_or(0);
+        Effects {
+            rows: Arc::new(Mutex::new(rows)),
+            seq: Arc::new(Mutex::new(seq)),
+            broken: Arc::default(),
+            running: Arc::default(),
+            log: Some(Arc::new(Mutex::new(log))),
+        }
+    }
+
+    /// Whether every change is being recorded.
+    pub fn is_durable(&self) -> bool {
+        self.log.is_some()
+    }
+
+    /// Record a change of `effect`'s row, best effort.
+    ///
+    /// A log write that fails does not fail the queue: the work still runs, it
+    /// just will not survive a restart. Losing durability is better than
+    /// dropping the work, and the failure is reported on stderr so it is not
+    /// silent.
+    fn record(&self, effect: &Effect, seq: u64, attempts: u32, error: Option<&str>) {
+        let Some(log) = self.log.as_ref() else {
+            return;
+        };
+        let session = match effect {
+            Effect::Launch { session, .. } | Effect::Extend { session, .. } => session.clone(),
+            Effect::Relay { .. } => None,
+        };
+        // The due time is what makes a retry budget survive a restart, so it is
+        // read from the row rather than assumed to be "now".
+        let due_at = {
+            let rows = self.rows.lock().unwrap_or_else(|error| error.into_inner());
+            rows.iter()
+                .find(|row| row.effect.kind() == effect.kind() && row.effect.key() == effect.key())
+                .map(|row| {
+                    let wait = row.due.saturating_duration_since(Instant::now());
+                    crate::effects_log::now_ms() + wait.as_millis() as u64
+                })
+                .unwrap_or_else(crate::effects_log::now_ms)
+        };
+        let mut guard = log.lock().unwrap_or_else(|error| error.into_inner());
+        if let Err(write_error) = guard.append_queued(
+            effect,
+            seq,
+            session.as_deref(),
+            attempts,
+            due_at,
+            error,
+        ) {
+            eprintln!("rpi-superagent: could not record an effect: {write_error}");
+        }
+    }
+
+    /// Record that `kind`'s row for `key` reached `state`.
+    fn record_state(&self, kind: Kind, key: &str, seq: u64, state: crate::effects_log::State) {
+        let Some(log) = self.log.as_ref() else {
+            return;
+        };
+        let mut guard = log.lock().unwrap_or_else(|error| error.into_inner());
+        if let Err(error) = guard.append_state(kind, key, seq, state, None) {
+            eprintln!("rpi-superagent: could not record an effect state: {error}");
+        }
     }
 
     /// Queue an effect, replacing any waiting row of the same kind and key.
@@ -260,22 +338,31 @@ impl Effects {
     /// order."*
     pub fn enqueue(&self, effect: Effect) {
         let now = Instant::now();
-        let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
         let kind = effect.kind();
         let key = effect.key().to_string();
-        if let Some(row) = rows
-            .iter_mut()
-            .find(|row| row.effect.kind() == kind && row.effect.key() == key)
+        let seq;
         {
-            row.effect = effect;
-            row.attempts = 0;
-            row.error = None;
-            row.due = now;
-            return;
+            let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(index) = rows
+                .iter()
+                .position(|row| row.effect.kind() == kind && row.effect.key() == key)
+            {
+                // Replacing a waiting row keeps its queue position.
+                seq = rows[index].seq;
+                rows[index].effect = effect.clone();
+                rows[index].attempts = 0;
+                rows[index].error = None;
+                rows[index].due = now;
+                drop(rows);
+                self.record(&effect, seq, 0, None);
+                return;
+            }
+            let mut counter = self.seq.lock().unwrap_or_else(|e| e.into_inner());
+            *counter += 1;
+            seq = *counter;
+            rows.push(Row::new(effect.clone(), seq, now));
         }
-        let mut seq = self.seq.lock().unwrap_or_else(|e| e.into_inner());
-        *seq += 1;
-        rows.push(Row::new(effect, *seq, now));
+        self.record(&effect, seq, 0, None);
     }
 
     /// Every row, in queue order. For inspection and tests.
@@ -296,10 +383,18 @@ impl Effects {
 
     /// Drop a waiting row. A row already running finishes normally.
     pub fn cancel(&self, kind: Kind, key: &str) {
-        self.rows
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|row| !(row.effect.kind() == kind && row.effect.key() == key));
+        let seq = {
+            let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+            let found = rows
+                .iter()
+                .find(|row| row.effect.kind() == kind && row.effect.key() == key)
+                .map(|row| row.seq);
+            rows.retain(|row| !(row.effect.kind() == kind && row.effect.key() == key));
+            found
+        };
+        if let Some(seq) = seq {
+            self.record_state(kind, key, seq, crate::effects_log::State::Cancelled);
+        }
     }
 
     /// Whether a kind is reported as broken (its last `FAILURES_BEFORE_ERROR`
@@ -381,40 +476,82 @@ impl Effects {
 
     /// Apply a row's outcome: remove it, defer it, or back it off.
     fn settle(&self, kind: Kind, key: &str, seq: u64, outcome: Result<(), Outcome>) {
-        let now = Instant::now();
-        let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(index) = rows
-            .iter()
-            .position(|row| row.effect.kind() == kind && row.effect.key() == key && row.seq == seq)
-        else {
-            // The row was cancelled while it ran, or replaced. Its result is for
-            // a payload that is no longer queued, so drop it.
-            return;
+        // Normalised once, so the two matches below cannot fight over ownership.
+        let outcome = match outcome {
+            Ok(()) => Ok(()),
+            Err(Outcome::Later(reason)) => Err(Outcome::Later(reason)),
+            Err(Outcome::Failed(message)) => Err(Outcome::Failed(message)),
         };
-        match outcome {
+        let now = Instant::now();
+        {
+            let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(index) = rows.iter().position(|row| {
+                row.effect.kind() == kind && row.effect.key() == key && row.seq == seq
+            }) else {
+                // The row was cancelled while it ran, or replaced. Its result is
+                // for a payload that is no longer queued, so drop it.
+                return;
+            };
+            match &outcome {
+                Ok(()) => {
+                    rows.remove(index);
+                }
+                Err(Outcome::Later(_reason)) => {
+                    // Deferred, not failed: no attempt is counted.
+                    let (initial, _) = kind.retry();
+                    rows[index].due = now + initial;
+                }
+                Err(Outcome::Failed(message)) => {
+                    let (initial, maximum) = kind.retry();
+                    let row = &mut rows[index];
+                    row.attempts = row.attempts.saturating_add(1);
+                    let shift = row.attempts.min(16);
+                    let delay = initial.saturating_mul(1u32 << shift).min(maximum);
+                    row.due = now + delay;
+                    row.error = Some(message.clone());
+                }
+            }
+        }
+        // Bookkeeping outside the rows lock, and recorded so the log matches
+        // what the queue now holds.
+        match &outcome {
             Ok(()) => {
-                rows.remove(index);
                 self.broken
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&kind);
+                self.record_state(kind, key, seq, crate::effects_log::State::Done);
             }
-            Err(Outcome::Later(_reason)) => {
-                // Deferred, not failed: no attempt is counted.
-                let (initial, _) = kind.retry();
-                rows[index].due = now + initial;
+            Err(Outcome::Later(_)) => {
+                // A deferral is not a state change worth a line: the row is still
+                // queued with the same attempts, and the due time is recomputed
+                // from the retry policy on the next load.
             }
             Err(Outcome::Failed(message)) => {
-                let (initial, maximum) = kind.retry();
-                let row = &mut rows[index];
-                row.attempts = row.attempts.saturating_add(1);
-                let shift = row.attempts.min(16);
-                let delay = initial.saturating_mul(1u32 << shift).min(maximum);
-                row.due = now + delay;
-                row.error = Some(message);
-                let mut broken = self.broken.lock().unwrap_or_else(|e| e.into_inner());
-                let count = broken.entry(kind).or_default();
-                *count = count.saturating_add(1);
+                self.broken
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(kind)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+                let attempts = self
+                    .rows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .find(|row| row.effect.kind() == kind && row.effect.key() == key)
+                    .map(|row| row.attempts)
+                    .unwrap_or(1);
+                let effect = self
+                    .rows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .find(|row| row.effect.kind() == kind && row.effect.key() == key)
+                    .map(|row| row.effect.clone());
+                if let Some(effect) = effect {
+                    self.record(&effect, seq, attempts, Some(message));
+                }
             }
         }
     }
@@ -615,6 +752,76 @@ mod tests {
             }
             other => panic!("unexpected effect: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_durable_queue_resumes_after_a_restart() {
+        // The point of the log: a process that dies mid-queue does not lose the
+        // work. A second `Effects` over the same log is what a restart sees.
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-superagent-durable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let log = crate::effects_log::Log::open(&dir, "s1").unwrap();
+            let queue = Effects::durable(log);
+            assert!(queue.is_durable());
+            queue.enqueue(Effect::Launch {
+                task_id: "T1".into(),
+                nodes: vec!["a".into()],
+                max_parallel: 2,
+                binding: Binding {
+                    provider: Some("anthropic".into()),
+                    model: Some("claude-sonnet-5".into()),
+                },
+                session: Some("sess-9".into()),
+            });
+        }
+
+        // A fresh handle stands in for a new process.
+        let log = crate::effects_log::Log::open(&dir, "s1").unwrap();
+        let resumed = Effects::durable(log);
+        let rows = resumed.rows();
+        assert_eq!(rows.len(), 1, "the queued row came back");
+        match &rows[0].effect {
+            Effect::Launch {
+                task_id,
+                binding,
+                session,
+                ..
+            } => {
+                assert_eq!(task_id, "T1");
+                assert_eq!(binding.model.as_deref(), Some("claude-sonnet-5"));
+                assert_eq!(session.as_deref(), Some("sess-9"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finished_row_does_not_come_back_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-superagent-durable-done-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let log = crate::effects_log::Log::open(&dir, "s1").unwrap();
+            let queue = Effects::durable(log);
+            queue.enqueue(launch("T1"));
+            assert_eq!(queue.dispatch(|_| Ok(())), 1);
+        }
+
+        let log = crate::effects_log::Log::open(&dir, "s1").unwrap();
+        assert!(
+            Effects::durable(log).rows().is_empty(),
+            "a completed row must not be retried after a restart"
+        );
     }
 
     #[test]

@@ -29,10 +29,12 @@ mod guide;
 mod dispatch;
 mod effects;
 mod effects_handler;
+mod effects_log;
 mod graph;
 mod host;
 mod kit;
 mod passes;
+pub mod passes_daemon;
 mod plan;
 mod spawn;
 mod subagent;
@@ -96,8 +98,57 @@ pub(crate) fn graph_task_id() -> Option<String> {
 static EFFECTS: OnceLock<effects::Effects> = OnceLock::new();
 
 /// The effect queue, created on first use.
+///
+/// Durable when a working directory is available: the rows go to a JSONL log
+/// under `.rpi/superagent-effects/`, so a queued wave survives the host exiting.
+/// Without a directory the queue is memory-only, which still runs work but
+/// cannot outlive the process.
 pub(crate) fn effects() -> &'static effects::Effects {
-    EFFECTS.get_or_init(effects::Effects::new)
+    EFFECTS.get_or_init(|| {
+        match std::env::current_dir()
+            .ok()
+            .map(|cwd| crate::effects_log::effects_root(&cwd))
+            .map(|root| (root.clone(), crate::effects_log::Log::open(&root, &owner())))
+        {
+            Some((_root, Ok(log))) => effects::Effects::durable(log),
+            // A log that will not open is a reason to lose durability, not to
+            // lose the work: fall back to memory and say so.
+            Some((root, Err(error))) => {
+                eprintln!(
+                    "rpi-superagent: effect log at {} unavailable ({error}); queue is memory-only",
+                    root.display()
+                );
+                effects::Effects::new()
+            }
+            None => effects::Effects::new(),
+        }
+    })
+}
+
+/// The name of this process's effect log.
+///
+/// One log per agent directory, so two independent rpi installs on one machine do
+/// not share a queue. The daemon scans every log, so the name only has to be
+/// stable, not meaningful.
+pub(crate) fn owner() -> String {
+    let dir = std::env::var("RPI_CODING_AGENT_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    // The id is a path; the log name must not be. A short hash keeps logs apart
+    // without carrying a path into a file name.
+    format!("agent-{:016x}", fnv1a(&dir))
+}
+
+/// A 64-bit FNV-1a hash, for turning a path into a short stable name.
+fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// The pass scheduler, started once per process.
@@ -254,10 +305,19 @@ rpi_plugin_sdk::export_plugin!(|api| {
     // call arrives, so it gets its own thread rather than riding the host's
     // turn. Started once per process: a second scheduler would race the first
     // over the same rows.
+    //
+    // The thread only lives as long as this process, so a durable queue is also
+    // served by a separate daemon (`rpi-superagent-passes`), which outlives the
+    // host. The two are safe together: the daemon takes a lock on the log, and the
+    // thread handles the common case where the host is up anyway.
     let _ = PASSES.set(Mutex::new(passes::Passes::start(
         effects().clone(),
         effects_handler::run,
     )));
+    if let Ok(cwd) = std::env::current_dir() {
+        let _ = passes_daemon::create_root(&passes_daemon::effects_dir(&cwd));
+        passes_daemon::start_daemon(&cwd);
+    }
 
 
     if let Some(register_prompt) = api.register_before_agent_start {

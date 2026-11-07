@@ -23,7 +23,17 @@ crate-type = ["cdylib", "rlib"]
 name = "rpi-superagent-supervisor"
 path = "src/bin/supervisor.rs"
 
+[[bin]]
+# The pass scheduler: the process that drives the effect queue when the host
+# that queued the work may exit at any moment. A thread cannot do this job — it
+# dies with its host — so the queue is durable on disk and this program is what
+# reads it. Named `-passes` for the same reason the supervisor is named rather
+# than sharing the package's stem.
+name = "rpi-superagent-passes"
+path = "src/bin/passes.rs"
+
 [dependencies]
 rpi-plugin-sdk = { workspace = true, features = ["process"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 wait-timeout = { workspace = true }

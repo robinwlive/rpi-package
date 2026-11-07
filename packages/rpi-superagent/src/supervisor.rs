@@ -436,7 +436,7 @@ fn supervisor_executable() -> Option<PathBuf> {
 /// `dladdr` reports the path of the running image, which for a plugin is the
 /// extension itself.
 #[cfg(unix)]
-fn extension_dir() -> Option<PathBuf> {
+pub(crate) fn extension_dir() -> Option<PathBuf> {
     use std::ffi::c_void;
     #[repr(C)]
     struct DlInfo {
@@ -469,7 +469,7 @@ fn extension_dir() -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn extension_dir() -> Option<PathBuf> {
+pub(crate) fn extension_dir() -> Option<PathBuf> {
     None
 }
 
