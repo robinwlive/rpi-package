@@ -195,7 +195,16 @@ pub fn child_command_with_session(
     tier: u32,
 ) -> Command {
     let mut command = Command::new(exe);
-    command.arg("-p");
+    // `--mode rpc`, not `-p`. A one-shot `-p` run has **no way to answer a
+    // question**: the extension `UiDialog` mailbox is never bridged to anything,
+    // so a worker that asks sits there until the wall-clock deadline kills it
+    // (the default is 300 s, and the failure looks like "the worker hung").
+    //
+    // rpc bridges that mailbox over stdin/stdout instead: the host writes
+    // `{"type":"ui_dialog_request",…}` and accepts `{"type":"ui_dialog_response"}`
+    // back. That is also what makes the worker steerable (SetModel / Abort) by a
+    // caller later, which `-p` cannot do at all.
+    command.arg("--mode").arg("rpc");
     match session.filter(|value| !value.is_empty()) {
         Some(session) => {
             if let Some(dir) = session_dir {
@@ -556,12 +565,15 @@ pub fn run_child_reporting(
     // and signals completion through a channel, so collecting output can never
     // outwait the deadline: a descendant that inherits the pipe and outlives the
     // direct child must not extend the call.
-    let out_reader = child.stdout.take().map(spawn_reader);
+    // stdout is a JSONL event stream (rpc); stderr stays raw text.
+    let out_reader = child.stdout.take().map(spawn_event_reader);
     let err_reader = child.stderr.take().map(spawn_reader);
 
     // Writing is part of the bounded lifecycle too: a child that never reads
     // stdin must not make the tool hang before the wait loop starts.
-    write_stdin(child.stdin.take(), task);
+    // One prompt frame. In rpc mode a bare text line is not a command, so the
+    // worker would wait forever; see `prompt_frame`.
+    write_stdin(child.stdin.take(), &prompt_frame(task));
 
     // Wait in slices so cancellation and the wall-clock deadline are both observed
     // while the child is still running.
@@ -579,8 +591,8 @@ pub fn run_child_reporting(
             .min(POLL_SLICE);
         match child.wait_timeout(slice) {
             Ok(Some(status)) => {
-                let mut text = match collect_reader(out_reader, deadline, control) {
-                    Ok(text) => text,
+                let outcome = match collect_outcome(out_reader, deadline, control) {
+                    Ok(outcome) => outcome,
                     Err(error) => {
                         kill_and_reap(&mut child, &tree);
                         return Err(error);
@@ -593,6 +605,18 @@ pub fn run_child_reporting(
                         return Err(error);
                     }
                 };
+                let mut text = outcome.reply;
+                // Questions nobody answered are **carried out, not dropped**.
+                // Before `--mode rpc` these hung the worker until the deadline;
+                // now the caller at least learns what was asked, so a person can
+                // answer it on the next node instead of guessing why it stalled.
+                if !outcome.questions.is_empty() {
+                    text.push_str(&format!(
+                        "\n\n[worker asked {} question(s), unanswered]\n- {}",
+                        outcome.questions.len(),
+                        outcome.questions.join("\n- ")
+                    ));
+                }
                 if !status.success() && !stderr_text.trim().is_empty() {
                     text.push_str("\n[stderr]\n");
                     text.push_str(stderr_text.trim_end());
@@ -601,7 +625,11 @@ pub fn run_child_reporting(
                 // can read it later, and only the summary stays in the window.
                 // The node name is the engine-assigned session name (see
                 // `engine_session_name`), task is the long-task id.
-                let (text, _spill) = spill_output(text, task_id, session.filter(|v| !v.is_empty()).unwrap_or("ephemeral"));
+                let (text, _spill) = spill_output(
+                    text,
+                    task_id,
+                    session.filter(|v| !v.is_empty()).unwrap_or("ephemeral"),
+                );
                 if !status.success() {
                     // Name the binding in the failure: without it a `No API key` or
                     // `No model matches` from the child is unattributable, and the
@@ -726,6 +754,132 @@ pub(crate) fn kill_descendants(pid: u32) {
         .status();
 }
 
+/// The one prompt frame an `rpc` worker receives, as a single JSONL line.
+///
+/// `-p` takes the prompt as raw stdin text; `--mode rpc` takes it as a `prompt`
+/// *frame*. Sending raw text to an rpc host is not an error it reports — the
+/// line is simply not a frame, so the worker sits waiting for a prompt that never
+/// arrives and is finally killed by the wall clock. That is why this is a frame
+/// builder and not a `format!` at the call site.
+///
+/// `content` is the accepted legacy form (`PromptPayload::Legacy`).
+pub(crate) fn prompt_frame(task: &str) -> String {
+    serde_json::json!({
+        "type": "prompt",
+        "content": task,
+    })
+    .to_string()
+}
+
+/// What an `rpc` worker's stdout yielded, after folding its event stream.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RpcOutcome {
+    /// The last turn's assistant text — what the worker ended up saying.
+    pub reply: String,
+    /// Questions the worker asked and nobody answered (`ui_dialog_request`
+    /// without a matching close). Carried out so they are not silently lost.
+    pub questions: Vec<String>,
+    /// Whether any `turn_end` or `agent_end` arrived, i.e. the worker actually ran.
+    pub finished: bool,
+}
+
+/// Fold one JSONL event line from an `rpc` worker.
+///
+/// Returns `false` for lines that are not events (`ready`, responses to our own
+/// requests) so the caller can ignore them without treating them as garbage.
+///
+/// Kept pure and separate from the wait loop: the shape of these frames is the
+/// contract with `rpi`, and a unit test is the only thing that will notice when
+/// upstream renames a field.
+pub fn fold_rpc_event(line: &str, out: &mut RpcOutcome) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return false;
+    };
+    let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    match kind {
+        // The final assistant message of a turn. `message` mirrors the session
+        // entry shape, so the text is in `content[]`.
+        "turn_end" | "agent_end" => {
+            if let Some(message) = value.get("message") {
+                let text = message_text(message);
+                if !text.is_empty() {
+                    out.reply = text;
+                }
+                out.finished = true;
+            } else if kind == "agent_end" {
+                // `agent_end` carries `messages` (plural) instead of one message.
+                if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
+                    if let Some(last) = messages
+                        .iter()
+                        .rev()
+                        .find_map(|m| {
+                            let t = message_text(m);
+                            if t.is_empty() { None } else { Some(t) }
+                        })
+                    {
+                        out.reply = last;
+                    }
+                }
+                out.finished = true;
+            }
+        }
+        // A question with no one to answer it. Collected, never discarded:
+        // dropping it is what left workers hanging until the timeout.
+        "ui_dialog_request" => {
+            let id = value
+                .get("requestId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let question = value
+                .get("ui")
+                .map(describe_ui)
+                .unwrap_or_else(|| "(no payload)".into());
+            out.questions.push(format!("requestId={id} {question}"));
+        }
+        // A question that got cancelled; nothing to report.
+        "ui_dialog_closed" => {}
+        _ => {}
+    }
+    true
+}
+
+/// Pull the text out of a message payload (`content: [{type:"text",text}]`).
+fn message_text(message: &serde_json::Value) -> String {
+    match message.get("content") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| {
+                let ty = block.get("type").and_then(serde_json::Value::as_str)?;
+                // Only text blocks: a tool call's arguments are not an answer.
+                if ty != "text" {
+                    return None;
+                }
+                block
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// A one-line description of a dialog request, for the "unanswered" report.
+fn describe_ui(ui: &serde_json::Value) -> String {
+    for key in ["message", "prompt", "title", "text"] {
+        if let Some(text) = ui.get(key).and_then(serde_json::Value::as_str) {
+            if !text.trim().is_empty() {
+                return text.trim().to_string();
+            }
+        }
+    }
+    ui.to_string()
+}
+
 fn write_stdin(mut stdin: Option<std::process::ChildStdin>, task: &str) {
     // A child that never reads (or exits first) must not block the caller, so the
     // write happens on its own thread; EPIPE is not fatal — the exit status is
@@ -738,6 +892,29 @@ fn write_stdin(mut stdin: Option<std::process::ChildStdin>, task: &str) {
             let _ = stdin.flush();
         }
     });
+}
+
+/// Collect an `rpc` worker's event stream into an [`RpcOutcome`].
+///
+/// Mirrors [`collect_reader`]'s deadline discipline: a descendant holding the pipe
+/// must not extend the call past the wall clock.
+pub(crate) fn collect_outcome(
+    reader: Option<(Receiver<RpcOutcome>, JoinHandle<()>)>,
+    deadline: Instant,
+    control: &Control,
+) -> Result<RpcOutcome, String> {
+    control.check()?;
+    let Some((receiver, _handle)) = reader else {
+        return Ok(RpcOutcome::default());
+    };
+    let slice = deadline.saturating_duration_since(Instant::now());
+    match receiver.recv_timeout(slice) {
+        Ok(outcome) => Ok(outcome),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("timed out reading the worker's event stream".into())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(RpcOutcome::default()),
+    }
 }
 
 /// Read a child's stream with a hard cap, signalling completion over a channel so
@@ -776,11 +953,155 @@ pub(crate) fn spawn_reader<R: Read + Send + 'static>(
     (receiver, handle)
 }
 
+/// Read an `rpc` worker's stdout as a JSONL event stream.
+///
+/// Unlike [`spawn_reader`], this does not return raw text: in rpc mode every line
+/// is a frame, and the answer lives inside `turn_end` / `agent_end` rather than in
+/// the bytes themselves. Returning the raw stream would hand the caller a wall of
+/// JSON as if it were the worker's reply.
+///
+/// Lines that fail to parse are kept as `noise` rather than dropped: a non-frame
+/// line usually means the host printed a diagnostic, and that is exactly what
+/// explains a worker that "ran but said nothing".
+pub(crate) fn spawn_event_reader<R: Read + Send + 'static>(
+    mut reader: R,
+) -> (Receiver<RpcOutcome>, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut outcome = RpcOutcome::default();
+        let mut pending = String::new();
+        let mut buf = [0u8; 8192];
+        let mut raw_bytes = 0usize;
+        let mut raw_tail = String::new();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => {
+                    // Bound what we are willing to buffer: a worker that streams
+                    // megabytes must not grow this thread without limit.
+                    raw_bytes = raw_bytes.saturating_add(count);
+                    pending.push_str(&String::from_utf8_lossy(&buf[..count]));
+                    // Keep a bounded copy of the raw stream for the failure text.
+                    if raw_tail.len() < 4_000 {
+                        raw_tail.push_str(&String::from_utf8_lossy(&buf[..count]));
+                        if raw_tail.len() > 4_000 {
+                            let cut = raw_tail
+                                .char_indices()
+                                .map(|(i, _)| i)
+                                .find(|i| *i > 4_000)
+                                .unwrap_or(raw_tail.len());
+                            raw_tail.truncate(cut);
+                        }
+                    }
+                    while let Some(pos) = pending.find('\n') {
+                        let line: String = pending.drain(..=pos).collect();
+                        fold_rpc_event(&line, &mut outcome);
+                    }
+                    if raw_bytes > MAX_OUTPUT_BYTES * 8 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // A last line without a trailing newline still counts.
+        if !pending.trim().is_empty() {
+            fold_rpc_event(&pending, &mut outcome);
+        }
+        if !outcome.finished && outcome.reply.is_empty() {
+            // Nothing parsed as an answer: hand back what the host actually said,
+            // so "worker produced nothing" has a cause attached.
+            outcome.reply = format!(
+                "[no turn_end / agent_end in the worker's output]\n{}",
+                raw_tail.trim_end()
+            );
+        }
+        let _ = sender.send(outcome);
+    });
+    (receiver, handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The prompt must be a `prompt` **frame**, not raw text.
+    ///
+    /// `-p` took raw stdin; `--mode rpc` parses JSONL. Text sent to an rpc host is
+    /// not rejected — it simply is not a command, so the worker waits for a prompt
+    /// that never arrives and dies on the wall clock. The failure looks like "the
+    /// worker hung", which is why this gets a test rather than a comment.
+    #[test]
+    fn the_prompt_is_a_prompt_frame_not_raw_text() {
+        let line = prompt_frame("do the thing");
+        // One line: JSONL framing breaks if the payload embeds a newline.
+        assert!(!line.contains('\n'), "frame must be one line: {line}");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["type"], "prompt");
+        assert_eq!(value["content"], "do the thing");
+    }
+
+    /// A multi-line task still produces a single line of JSON.
+    #[test]
+    fn a_multiline_task_stays_one_frame() {
+        let line = prompt_frame("line one\nline two");
+        assert_eq!(line.lines().count(), 1);
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["content"], "line one\nline two");
+    }
+
+    /// `turn_end` carries the answer inside `message.content[]`.
+    #[test]
+    fn turn_end_becomes_the_reply() {
+        let mut out = RpcOutcome::default();
+        let line = r#"{"type":"turn_end","message":{"content":[{"type":"text","text":"all done"}]},"toolResultCount":0,"toolResults":[]}"#;
+        assert!(fold_rpc_event(line, &mut out));
+        assert_eq!(out.reply, "all done");
+        assert!(out.finished);
+    }
+
+    /// A tool call's arguments are not an answer: only `text` blocks count.
+    #[test]
+    fn tool_call_blocks_are_not_treated_as_the_reply() {
+        let mut out = RpcOutcome::default();
+        let line = r#"{"type":"turn_end","message":{"content":[{"type":"toolCall","name":"bash","arguments":{"command":"ls"}}]},"toolResultCount":1,"toolResults":[]}"#;
+        fold_rpc_event(line, &mut out);
+        assert_eq!(out.reply, "");
+        assert!(out.finished, "the turn still ended");
+    }
+
+    /// An unanswered question is collected, not dropped.
+    ///
+    /// Dropping it is what left workers hanging to the 300 s deadline with no
+    /// trace of what they wanted.
+    #[test]
+    fn a_dialog_request_is_carried_out() {
+        let mut out = RpcOutcome::default();
+        let line = r#"{"type":"ui_dialog_request","requestId":"pidingo:1","ui":{"message":"which file?"}}"#;
+        fold_rpc_event(line, &mut out);
+        assert_eq!(out.questions.len(), 1);
+        assert!(out.questions[0].contains("requestId=pidingo:1"));
+        assert!(out.questions[0].contains("which file?"));
+    }
+
+    /// Frames we do not act on must not be mistaken for data.
+    ///
+    /// `raise` is the return value: `true` means "this line was a well-formed
+    /// frame", not "this line said something". Only unparseable lines are `false`
+    /// (those are host diagnostics, kept for the failure text).
+    #[test]
+    fn frames_we_do_not_use_leave_the_outcome_empty() {
+        let mut out = RpcOutcome::default();
+        assert!(fold_rpc_event(r#"{"type":"ready"}"#, &mut out), "a ready frame parses");
+        assert!(
+            !fold_rpc_event("not json at all", &mut out),
+            "garbage is not a frame"
+        );
+        // Neither one contributes an answer or a question.
+        assert_eq!(out, RpcOutcome::default());
+    }
 
     /// A fresh directory under the system temp dir, holding sessions for one
     /// test. Named per test so two runs do not share one.
@@ -971,7 +1292,7 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec!["-p", "--no-session", "--exclude-tools", EXCLUDED_TOOLS]
+            vec!["--mode", "rpc", "--no-session", "--exclude-tools", EXCLUDED_TOOLS]
         );
 
         let envs: Vec<(String, String)> = command
@@ -1048,7 +1369,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-p",
+                "--mode", "rpc",
                 "--session-dir",
                 dir.to_str().unwrap(),
                 "--name",
@@ -1100,7 +1421,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-p",
+                "--mode", "rpc",
                 "--session-dir",
                 dir.to_str().unwrap(),
                 "--session",
@@ -1149,7 +1470,7 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec!["-p", "--no-session", "--exclude-tools", EXCLUDED_TOOLS]
+            vec!["--mode", "rpc", "--no-session", "--exclude-tools", EXCLUDED_TOOLS]
         );
     }
 
@@ -1169,7 +1490,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-p",
+                "--mode", "rpc",
                 "--no-session",
                 "--exclude-tools",
                 EXCLUDED_TOOLS,
@@ -1188,7 +1509,7 @@ mod tests {
             .collect();
         assert_eq!(
             bare_args,
-            vec!["-p", "--no-session", "--exclude-tools", EXCLUDED_TOOLS]
+            vec!["--mode", "rpc", "--no-session", "--exclude-tools", EXCLUDED_TOOLS]
         );
     }
 
