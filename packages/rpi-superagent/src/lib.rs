@@ -312,20 +312,15 @@ rpi_plugin_sdk::export_plugin!(|api| {
     // instead of quietly resolving the default provider.
     crate::host::install(api);
 
-    // A host that dies leaves its children running, and nothing in the
-    // session can clean them up afterwards. The supervisor is a separate
-    // process for exactly that reason.
-    crate::supervisor::start_supervisor();
-
-    // The pass scheduler. A queued wave must run whether or not another tool
-    // call arrives, so it gets its own thread rather than riding the host's
-    // turn. Started once per process: a second scheduler would race the first
-    // over the same rows.
+    // Two things must run after this host is gone: the effect queue, and the
+    // sweep that kills workers whose host died. One daemon does both — it was two
+    // programs at first, which bought nothing but two locks and two launches.
     //
-    // The thread only lives as long as this process, so a durable queue is also
-    // served by a separate daemon (`rpi-superagent-passes`), which outlives the
-    // host. The two are safe together: the daemon takes a lock on the log, and the
-    // thread handles the common case where the host is up anyway.
+    // The in-process scheduler below still starts, and is not redundant: while
+    // this host is up it runs queued work without a 2s tick of latency, and the
+    // daemon covers the case where the host dies. The daemon's lock keeps two
+    // daemons apart; the thread and the daemon are kept apart by the graph's
+    // running-wave check.
     let _ = PASSES.set(Mutex::new(passes::Passes::start(
         effects().clone(),
         effects_handler::run,

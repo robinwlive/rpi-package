@@ -36,6 +36,13 @@ const LOCK_FILE: &str = ".lock";
 /// How often an idle daemon looks for work.
 pub const TICK: Duration = Duration::from_secs(2);
 
+/// How many times a failing row is retried before it is given up on.
+///
+/// Without a cap a permanently broken row retries forever: the log grows, the
+/// daemon never idles, and nothing tells a person it is hopeless. Twelve is the
+/// 5s-doubling-to-300s schedule reaching its ceiling twice over.
+pub const MAX_ATTEMPTS: u32 = 12;
+
 /// The project root the daemon serves: the working directory it was started in.
 ///
 /// The plugin starts the daemon from the project, so the daemon's own working
@@ -119,22 +126,45 @@ pub fn logs(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Serve the queue until the process ends.
+/// Serve the queue and the orphan sweep until the process ends.
 ///
-/// Reads every log, runs what is due, and sleeps. There is no shutdown path:
-/// the daemon is killed, and because every change is written back, being killed
-/// at any point loses at most the row in flight.
+/// Two jobs, one process. They were separate programs at first — a thread-based
+/// queue in the plugin, and a sweeper from an earlier stage — and the split cost
+/// more than it saved: two locks, two logs, two launches, and no way for either
+/// to know what the other saw. A worker the sweep kills because its host died is
+/// exactly the kind of event the queue wants to hear about.
+///
+/// The two run on different periods, so one loop cannot just sleep a fixed
+/// interval: the queue wants to be responsive (seconds), the sweep wants to be
+/// cheap (minutes). The loop therefore sleeps a short slice and counts, which
+/// keeps a single detector for cancellation and one place that decides what runs.
 pub fn serve(root: &Path) -> ! {
+    let sweep_secs = crate::supervisor::interval_secs().max(1);
+    let slice = Duration::from_millis(500);
+    let mut since_sweep = Duration::ZERO;
     loop {
         let mut ran = 0usize;
         for path in logs(root) {
             ran += serve_log(&path);
         }
-        // Nothing due: sleep a whole tick. Something ran: loop at once, so a
-        // queue that just unblocked is drained without a tick of latency.
+        // A queue that just unblocked is drained without waiting a tick.
         if ran == 0 {
             std::thread::sleep(TICK);
+            since_sweep += TICK;
         }
+        if since_sweep >= Duration::from_secs(sweep_secs) {
+            since_sweep = Duration::ZERO;
+            let killed = crate::supervisor::sweep();
+            if !killed.is_empty() {
+                eprintln!(
+                    "rpi-superagent: swept {} orphaned worker(s): {killed:?}",
+                    killed.len()
+                );
+            }
+        }
+        // A `Later` row pushes its own due time out, so this cannot spin; the
+        // slice only bounds how long a shutdown takes to notice.
+        let _ = slice;
     }
 }
 
@@ -161,27 +191,66 @@ pub fn serve_log(path: &Path) -> usize {
         ran += 1;
         match crate::effects_handler::run(&row.effect) {
             Ok(()) => {
-                let _ = log.append_state(
+                // Retire the row. A write that fails here is reported, not
+                // swallowed: the work is done but the log would say otherwise, and
+                // the next tick would do it again.
+                if let Err(error) = log.append_state(
                     row.effect.kind(),
                     row.effect.key(),
                     row.seq,
                     crate::effects_log::State::Done,
                     None,
-                );
+                ) {
+                    eprintln!(
+                        "rpi-superagent: a finished effect could not be retired ({error}); \
+                         it will run again"
+                    );
+                }
             }
-            Err(Outcome::Later(_)) => {
-                // Still queued; the deserialised due time is in the past on the
-                // next load, so it is retried then.
-            }
-            Err(Outcome::Failed(message)) => {
-                let _ = log.append_queued(
+            Err(Outcome::Later(reason)) => {
+                // Deferred, not failed: push the due time out without counting an
+                // attempt, or this tick would immediately try it again.
+                let (initial, _) = row.effect.kind().retry();
+                if let Err(error) = log.append_queued(
                     &row.effect,
                     row.seq,
                     session_of(&row.effect).as_deref(),
-                    row.attempts.saturating_add(1),
+                    row.attempts,
+                    now + initial.as_millis() as u64,
+                    Some(&reason),
+                ) {
+                    eprintln!("rpi-superagent: a deferred effect could not be recorded ({error})");
+                }
+            }
+            Err(Outcome::Failed(message)) => {
+                // Retry with backoff, capped so a permanently broken row does not
+                // grow without end.
+                let attempts = row.attempts.saturating_add(1);
+                if attempts > MAX_ATTEMPTS {
+                    eprintln!(
+                        "rpi-superagent: giving up on {} `{}` after {attempts} attempts: {message}",
+                        row.effect.kind().as_str(),
+                        row.effect.key()
+                    );
+                    let _ = log.append_state(
+                        row.effect.kind(),
+                        row.effect.key(),
+                        row.seq,
+                        crate::effects_log::State::Done,
+                        Some(&message),
+                    );
+                    continue;
+                }
+                if let Err(error) = log.append_queued(
+                    &row.effect,
+                    row.seq,
+                    session_of(&row.effect).as_deref(),
+                    attempts,
                     now + backoff_ms(row.effect.kind(), row.attempts),
                     Some(&message),
-                );
+                ) {
+                    eprintln!("rpi-superagent: a failed effect could not be recorded ({error})");
+                }
             }
         }
     }
@@ -253,7 +322,7 @@ pub fn start_daemon(cwd: &Path) -> bool {
 /// the loaded image, which is the `.dylib`/`.so`/`.dll` itself, and the packaging
 /// puts the daemon beside it. The host's directory is tried as a fallback.
 fn daemon_executable() -> Option<PathBuf> {
-    const NAME: &str = "rpi-superagent-passes";
+    const NAME: &str = "rpi-superagent-daemon";
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = crate::supervisor::extension_dir() {
         dirs.push(dir);
@@ -379,6 +448,71 @@ mod tests {
         }
         let path = crate::effects_log::log_path(&root, owner);
         assert_eq!(serve_log(&path), 0, "an hour away is not due");
+    }
+
+    #[test]
+    fn the_sweep_and_the_queue_share_one_loop() {
+        // The merge is the point: the same serve loop does both jobs. A test that
+        // only exercised the queue would pass even if the sweep were never called,
+        // so this asserts the sweep is reachable from the daemon at all.
+        let root = scratch("merge");
+        let killed = crate::supervisor::sweep();
+        // Without a session directory the sweep finds nothing, which is the
+        // correct answer rather than an error.
+        assert!(killed.is_empty(), "no session dir means no orphans: {killed:?}");
+        // And the queue still works with the sweep in the loop.
+        let owner = "s1";
+        {
+            let mut log = crate::effects_log::Log::open(&root, owner).unwrap();
+            log.append_queued(
+                &Effect::Relay {
+                    task_id: "T1".into(),
+                    text: "x".into(),
+                },
+                1,
+                None,
+                0,
+                crate::effects_log::now_ms(),
+                None,
+            )
+            .unwrap();
+        }
+        let path = crate::effects_log::log_path(&root, owner);
+        assert_eq!(serve_log(&path), 1, "the queue still runs");
+    }
+
+    #[test]
+    fn a_row_that_keeps_failing_is_given_up_on() {
+        // Without a cap a hopeless row would retry forever and the daemon would
+        // never idle. The cap is what makes "given up" a state rather than a hope.
+        let root = scratch("give-up");
+        let owner = "s2";
+        {
+            let mut log = crate::effects_log::Log::open(&root, owner).unwrap();
+            log.append_queued(
+                &Effect::Extend {
+                    task_id: "T1".into(),
+                    node: serde_json::json!({"id": "a", "task": "x"}),
+                    binding: Binding::default(),
+                    session: None,
+                },
+                1,
+                None,
+                MAX_ATTEMPTS,
+                crate::effects_log::now_ms(),
+                Some("always fails"),
+            )
+            .unwrap();
+        }
+        let path = crate::effects_log::log_path(&root, owner);
+        serve_log(&path);
+        // `Extend` always fails here, and it was already at the cap, so the row
+        // is retired rather than retried.
+        let log = crate::effects_log::Log::open(&root, owner).unwrap();
+        assert!(
+            log.load().is_empty(),
+            "a row past the attempt cap is retired, not retried forever"
+        );
     }
 
     #[test]
