@@ -649,6 +649,7 @@ mod tests {
             role: None,
             provider: None,
             model: None,
+            thinking: None,
             expect_file: None,
             verify: None,
             session: None,

@@ -14,35 +14,6 @@ use crate::kit::{result_with_details, Progress};
 use crate::lock_graph;
 use serde_json::Value;
 
-/// A note about the sessions a plan resumes, when any has grown large.
-///
-/// Silent when nothing is stale: a warning on every plan would be noise, and noise
-/// is what makes a real warning invisible.
-fn session_note(graph: &Graph) -> Option<String> {
-    let dir = crate::workspace::session_dir()?;
-    let mut stale = Vec::new();
-    for node in &graph.nodes {
-        let Some(name) = node.session.as_deref() else {
-            continue;
-        };
-        if let Some(size) = crate::spawn::session_size(&dir, name) {
-            if size.is_stale() {
-                stale.push(format!("`{name}` ({})", size.describe()));
-            }
-        }
-    }
-    if stale.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "Note: these worker sessions have grown large: {}. A resumed session re-sends \
-         its whole history every turn, so continuing one costs more each time. Consider \
-         starting a new session name and giving the worker a short summary of where the \
-         work stands.",
-        stale.join(", ")
-    ))
-}
-
 /// The agent-spawn generation this process was started at.
 ///
 /// Read from the environment rather than from the tool arguments: the model is
@@ -104,13 +75,7 @@ pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<S
     // Sessions named by this plan, measured so a caller can see when a resumed
     // worker has grown past what re-sending it every turn is worth. Reported at
     // `set`/`update` because that is when the choice is still cheap to change.
-    let mut render = graph.render();
-    if matches!(action, "set" | "update") {
-        if let Some(note) = session_note(graph) {
-            render.push_str("\n\n");
-            render.push_str(&note);
-        }
-    }
+    let render = graph.render();
     let result = result_with_details(&render, graph.to_details());
     if matches!(action, "set" | "update") {
         guard.advance_generation();

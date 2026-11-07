@@ -48,6 +48,8 @@ pub fn subagent(
     let selection = crate::host::parent_selection(params).effective(
         optional_trimmed(params, "provider").as_deref(),
         optional_trimmed(params, "model").as_deref(),
+        // A one-off delegation can name its own depth too; same override rule.
+        optional_trimmed(params, "thinking").as_deref(),
     );
 
     progress(progress_tx, &format!("[subagent] running (role={role})…"));

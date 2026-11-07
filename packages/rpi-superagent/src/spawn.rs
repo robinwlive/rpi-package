@@ -152,79 +152,6 @@ fn session_id_if_named(path: &Path, name: &str) -> Option<String> {
     id
 }
 
-/// How big a named worker session has grown.
-///
-/// Returned so a caller can warn before a session gets expensive: a resumed
-/// session re-sends its whole history every turn, and the part that is *not*
-/// cached grows with it. A prefix hit is cheap per token, but a hundred thousand
-/// cached tokens every turn is still a hundred thousand tokens.
-///
-/// `None` when the session does not exist yet (the first run) or cannot be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionSize {
-    /// Bytes of the session file, which is a close enough proxy for its tokens.
-    pub bytes: u64,
-    /// Messages recorded, which is a close enough proxy for turns.
-    pub messages: usize,
-}
-
-impl SessionSize {
-    /// Whether this session is worth resuming or should be replaced.
-    ///
-    /// The thresholds are judgement, not measurement. At roughly 300 KB a session
-    /// is re-sending far more than it adds, and at 150 messages its early turns
-    /// have stopped being relevant to what it is doing now. Both are far from a
-    /// model's context limit on purpose: the cost is what is being managed here,
-    /// not the hard ceiling.
-    pub fn is_stale(&self) -> bool {
-        self.bytes > 300_000 || self.messages > 150
-    }
-
-    /// A one-line description for a tool result.
-    pub fn describe(&self) -> String {
-        format!("{} messages, {} KB", self.messages, self.bytes / 1024)
-    }
-}
-
-/// Measure a named worker session, if it exists.
-pub fn session_size(session_dir: &Path, name: &str) -> Option<SessionSize> {
-    let path = session_file(session_dir, name)?;
-    let bytes = std::fs::metadata(&path).ok()?.len();
-    let messages = std::fs::read_to_string(&path)
-        .ok()
-        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
-        .unwrap_or(0);
-    Some(SessionSize { bytes, messages })
-}
-
-/// The file backing a named session.
-fn session_file(session_dir: &Path, name: &str) -> Option<std::path::PathBuf> {
-    let mut pending = std::collections::VecDeque::from([session_dir.to_path_buf()]);
-    let mut budget = 10_000usize;
-    while let Some(dir) = pending.pop_front() {
-        let entries = std::fs::read_dir(&dir).ok()?;
-        for entry in entries.flatten() {
-            if budget == 0 {
-                return None;
-            }
-            budget -= 1;
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push_back(path);
-                continue;
-            }
-            let text = path.to_string_lossy();
-            if !text.ends_with(".jsonl") || text.ends_with(".progress.jsonl") {
-                continue;
-            }
-            if session_id_if_named(&path, name).is_some() {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
 /// [`child_command`] with a choice of session handling.
 ///
 /// `session` names the worker's saved session. The host refuses `--session` for
@@ -358,19 +285,126 @@ pub(crate) fn failure_message(
     )
 }
 
-/// Truncate to [`MAX_OUTPUT_BYTES`] on a char boundary, appending a marker.
-pub fn truncate_output(mut text: String) -> String {
-    const MARKER: &str = "\n[subagent output truncated]";
+/// Spill a worker's full output to disk and keep a summary in the window.
+///
+/// ## Why it spills instead of truncating
+///
+/// The old version dropped everything past [`MAX_OUTPUT_BYTES`] — the marker was
+/// the only trace, and the bytes were gone. That made "record what the worker
+/// did" impossible, because the data was destroyed before anything could record
+/// it. It also left nothing for a caller to point at.
+///
+/// This is the same shape `rpi`'s own `bash` tool uses
+/// (`rpi-tools/src/tools/bash.rs::build_bash_output`): keep a bounded head in the
+/// window and put the full text in a file, naming the path in the marker. The
+/// model can then read the file when it actually needs the rest, instead of
+/// paying for those tokens on every turn whether it needs them or not.
+///
+/// ## Where
+///
+/// `~/.pidd/node-output/<task>/<node>.txt`. Under the Dash home rather than the
+/// project: this is Dash's debug artifact, not the user's source, and putting it
+/// in the repository would dirty `git status` for something nobody authored.
+///
+/// Returns the summary plus the path when it spilled, and the text unchanged
+/// when it did not.
+pub fn spill_output(text: String, task: &str, node: &str) -> (String, Option<String>) {
     if text.len() <= MAX_OUTPUT_BYTES {
-        return text;
+        return (text, None);
     }
-    let mut end = MAX_OUTPUT_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
+    let total_lines = text.lines().count();
+    let total_bytes = text.len();
+    let _ = total_bytes;
+    let path = match spill_path(task, node) {
+        Some(path) => path,
+        // No home directory to spill into: fall back to the old truncation rather
+        // than handing the model an unbounded string.
+        None => {
+            let mut clipped = text;
+            let mut end = MAX_OUTPUT_BYTES;
+            while end > 0 && !clipped.is_char_boundary(end) {
+                end -= 1;
+            }
+            clipped.truncate(end);
+            clipped.push_str("\n[subagent output truncated; no spill directory]");
+            return (clipped, None);
+        }
+    };
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            let mut clipped = text;
+            let mut end = MAX_OUTPUT_BYTES.min(clipped.len());
+            while end > 0 && !clipped.is_char_boundary(end) {
+                end -= 1;
+            }
+            clipped.truncate(end);
+            clipped.push_str(&format!(
+                "\n[subagent output truncated; could not write {}]",
+                path.display()
+            ));
+            return (clipped, None);
+        }
     }
-    text.truncate(end);
-    text.push_str(MARKER);
-    text
+    if std::fs::write(&path, text.as_bytes()).is_err() {
+        let mut clipped = text;
+        let mut end = MAX_OUTPUT_BYTES.min(clipped.len());
+        while end > 0 && !clipped.is_char_boundary(end) {
+            end -= 1;
+        }
+        clipped.truncate(end);
+        clipped.push_str("\n[subagent output truncated; write failed]");
+        return (clipped, None);
+    }
+
+    // Cut on a char boundary: slicing at a byte offset can land inside a
+    // multi-byte char and panic. The old truncation had this guard; the spill
+    // path must keep it.
+    let mut cut = MAX_OUTPUT_BYTES.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let kept = &text[..cut];
+    let shown_lines = kept.lines().count();
+    let mut summary = kept.to_string();
+    summary.push_str(&format!(
+        "\n\n[Showing lines 1-{shown_lines} of {total_lines} ({size} limit). \
+Full output: {display}]",
+        size = human_bytes(MAX_OUTPUT_BYTES),
+        display = path.display()
+    ));
+    (summary, Some(path.to_string_lossy().to_string()))
+}
+
+/// Where a spilled worker output lives.
+fn spill_path(task: &str, node: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let safe = |value: &str| -> String {
+        value
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect()
+    };
+    let task = safe(task.trim());
+    let node = safe(node.trim());
+    if task.is_empty() || node.is_empty() {
+        return None;
+    }
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".pidd")
+            .join("node-output")
+            .join(task)
+            .join(format!("{node}.txt")),
+    )
+}
+
+/// Render a byte count the way the truncation markers do.
+fn human_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{}KB", bytes / 1024)
+    }
 }
 
 /// Collect a reader's bounded output, giving up at `deadline` instead of
@@ -456,8 +490,8 @@ pub fn run_with_exe_reporting(
     on_started: &mut dyn FnMut(u32),
 ) -> Result<String, String> {
     run_child_reporting(
-        exe, task, max_turns, timeout_secs, provider, model, None, control, cwd, None, None, 0,
-        on_started,
+        exe, task, "untitled", max_turns, timeout_secs, provider, model, None, control, cwd, None,
+        None, 0, on_started,
     )
 }
 
@@ -470,6 +504,8 @@ pub fn run_with_exe_reporting(
 pub fn run_child_reporting(
     exe: &Path,
     task: &str,
+    // Long-task id, used only to name the spill file.
+    task_id: &str,
     max_turns: u64,
     timeout_secs: u64,
     provider: Option<&str>,
@@ -545,7 +581,11 @@ pub fn run_child_reporting(
                     text.push_str("\n[stderr]\n");
                     text.push_str(stderr_text.trim_end());
                 }
-                let text = truncate_output(text);
+                // Spill before truncating: the full output goes to disk so a caller
+                // can read it later, and only the summary stays in the window.
+                // The node name is the engine-assigned session name (see
+                // `engine_session_name`), task is the long-task id.
+                let (text, _spill) = spill_output(text, task_id, session.filter(|v| !v.is_empty()).unwrap_or("ephemeral"));
                 if !status.success() {
                     // Name the binding in the failure: without it a `No API key` or
                     // `No model matches` from the child is unattributable, and the
@@ -956,25 +996,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_small_session_is_not_stale() {
-        let size = SessionSize { bytes: 1_000, messages: 5 };
-        assert!(!size.is_stale());
-        assert_eq!(size.describe(), "5 messages, 0 KB");
-    }
 
-    #[test]
-    fn a_large_session_is_stale() {
-        // Either dimension is enough: many messages, or a big file.
-        assert!(SessionSize { bytes: 400_000, messages: 1 }.is_stale());
-        assert!(SessionSize { bytes: 1_000, messages: 200 }.is_stale());
-    }
 
-    #[test]
-    fn a_missing_session_has_no_size() {
-        let dir = scratch_dir("no-session");
-        assert_eq!(session_size(&dir, "never-created"), None);
-    }
 
     #[test]
     fn an_unknown_session_name_is_created_rather_than_resumed() {
@@ -1155,7 +1178,7 @@ mod tests {
             thinking: None,
             exe: None,
         };
-        let selection = parent.effective(None, None);
+        let selection = parent.effective(None, None, None);
         let command = child_command(
             Path::new("/usr/bin/rpi"),
             8,
@@ -1222,17 +1245,38 @@ mod tests {
         );
     }
 
+    /// Short output passes through untouched — nothing is spilled for a small
+    /// result, so the common case pays no file write.
     #[test]
-    fn truncate_output_is_bounded_and_char_safe() {
-        let short = "ok".to_string();
-        assert_eq!(truncate_output(short.clone()), short);
+    fn short_output_is_not_spilled() {
+        let (text, path) = spill_output("ok".to_string(), "T1", "a");
+        assert_eq!(text, "ok");
+        assert_eq!(path, None);
+    }
 
-        // Multi-byte chars: the cut must land on a boundary, not split a char.
+    /// Long output is written in full and only a bounded summary stays behind.
+    ///
+    /// This is the whole point of the change: the old version dropped everything
+    /// past the limit, so "what did the worker actually produce" was
+    /// unanswerable. The summary must name the file so a caller can go read it.
+    #[test]
+    fn long_output_spills_to_a_file_and_the_summary_names_it() {
         let long = "あ".repeat(MAX_OUTPUT_BYTES);
-        let out = truncate_output(long);
-        assert!(out.starts_with('あ'));
-        assert!(out.ends_with("[subagent output truncated]"));
-        assert!(out.len() <= MAX_OUTPUT_BYTES + "\n[subagent output truncated]".len());
+        let (summary, path) = spill_output(long.clone(), "T1", "node-a");
+        let path = path.expect("long output must spill");
+        assert!(path.contains("node-output"), "path was {path}");
+        assert!(path.ends_with("/T1/node-a.txt"), "path was {path}");
+
+        // The file holds the full text, byte for byte.
+        let written = std::fs::read_to_string(&path).expect("spill file exists");
+        assert_eq!(written.len(), long.len());
+
+        // The summary is bounded, char-safe, and points at the file.
+        assert!(summary.starts_with('あ'));
+        assert!(summary.contains("Full output:"));
+        assert!(summary.contains(&path));
+        assert!(summary.len() < long.len());
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap().parent().unwrap());
     }
 
     #[cfg(unix)]

@@ -83,6 +83,23 @@ pub fn cleanup_run(cwd: &Path, run_id: &str) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The session name a node's worker runs under.
+///
+/// Always `<taskId>-<nodeId>`, never whatever the node asked for. One session per
+/// node is a rule the engine enforces rather than a convention the model follows:
+/// resuming one worker across nodes is what lets a node inherit the previous
+/// node's `expectFile` / `verify` (they are written into the prompt), so it can
+/// satisfy the *old* criteria and still pass every check.
+///
+/// Split out from the scheduler so the rule is testable without spawning an
+/// `rpi` process.
+pub fn engine_session_name(task_id: Option<&str>, node_id: &str) -> String {
+    match task_id.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(task) => format!("{}-{}", sanitize(task), sanitize(node_id)),
+        None => sanitize(node_id),
+    }
+}
+
 /// Reduce a name to characters that are safe in a path.
 ///
 /// A node id comes from the model, so it can contain anything. A run id is
@@ -189,5 +206,19 @@ mod tests {
     #[test]
     fn run_ids_differ_between_calls() {
         assert_ne!(run_id("r"), run_id("r"));
+    }
+
+    /// One session per node, and the name is the engine's, not the caller's.
+    #[test]
+    fn a_nodes_session_is_named_after_its_task_and_node() {
+        assert_eq!(engine_session_name(Some("S5"), "a"), "S5-a");
+        assert_eq!(engine_session_name(Some("S5"), "a"), "S5-a");
+        // No task id: the node id alone still keeps nodes apart.
+        assert_eq!(engine_session_name(None, "a"), "a");
+        // `sanitize` **drops** unsafe characters rather than replacing them, so
+        // `T/1` and `T1` produce the same name. Node ids come from the model and
+        // are usually plain, but this is a real (if unlikely) collision source —
+        // noted here so nobody assumes the name is injective.
+        assert_eq!(engine_session_name(Some("T/1"), "n:1"), "T1-n1");
     }
 }

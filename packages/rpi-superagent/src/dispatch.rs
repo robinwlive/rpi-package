@@ -376,6 +376,35 @@ pub(super) fn dispatch_with(
     }
 
     let mut text = format!("dispatched {} node(s)\n\n{}", started.len(), graph.render());
+    // Tell the caller when a name it chose was overwritten. Silently ignoring it
+    // is worse than either honouring it or refusing it: the model would go on
+    // believing two nodes share a worker when they do not.
+    let overridden: Vec<String> = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.session
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|asked| {
+                    asked != crate::workspace::engine_session_name(graph.task_id.as_deref(), &node.id)
+                })
+        })
+        .map(|node| {
+            format!(
+                "`{}` → `{}`",
+                node.session.as_deref().unwrap_or(""),
+                crate::workspace::engine_session_name(graph.task_id.as_deref(), &node.id)
+            )
+        })
+        .collect();
+    if !overridden.is_empty() {
+        text.push_str(&format!(
+            "\n\nsession names overridden (one session per node, cross-node reuse is disabled): {}",
+            overridden.join(", ")
+        ));
+    }
     if !task_note.is_empty() {
         text.push_str("\n\n");
         text.push_str(&task_note);
@@ -542,7 +571,24 @@ pub(super) fn run_wave(
                     let id = id.clone();
                     let control = control.clone();
                     let selection =
-                        parent.effective(node.provider.as_deref(), node.model.as_deref());
+                        parent.effective(
+                            node.provider.as_deref(),
+                            node.model.as_deref(),
+                            node.thinking.as_deref(),
+                        );
+                    // One session per node, always `<taskId>-<nodeId>`.
+                    //
+                    // Any name the node asked for is overwritten. Resuming one
+                    // worker across nodes is what lets a node inherit the previous
+                    // node's assumptions — and worse, its `expectFile` / `verify`,
+                    // which are written into the prompt. A resumed worker then
+                    // satisfies the *old* criteria and produces the wrong artifact
+                    // while every check still passes (see `Node::session`).
+                    let engine_session = crate::workspace::engine_session_name(
+                        graph.task_id.as_deref(),
+                        &node.id,
+                    );
+
                     // A node that asked for isolation gets a directory of its
                     // own, so two parallel nodes cannot overwrite each other.
                     let node_dir = if node.isolation {
@@ -592,6 +638,7 @@ pub(super) fn run_wave(
                         spawn::run_child_reporting(
                             &exe,
                             &prompt,
+                            graph.task_id.as_deref().unwrap_or("untitled"),
                             node.max_turns,
                             node.timeout_secs,
                             selection.provider(),
@@ -599,7 +646,7 @@ pub(super) fn run_wave(
                             selection.thinking(),
                             &control,
                             node_dir.as_deref(),
-                            node.session.as_deref(),
+                            Some(engine_session.as_str()),
                             session_dir.as_deref(),
                             // One deeper than this wave: the worker's own output
                             // belongs to the next generation.

@@ -29,6 +29,11 @@ pub const MAX_TIER: u32 = 8;
 pub const DETAILS_VERSION: u32 = 1;
 pub const MAX_TASK_BYTES: usize = 20_000;
 
+/// Thinking levels a node may name (`rpi-ai`'s `ThinkingLevel`, lowercase).
+pub const THINKING_LEVELS: &[&str] = &[
+    "off", "minimal", "low", "medium", "high", "xhigh", "max",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Pending,
@@ -74,6 +79,17 @@ pub struct Node {
     pub role: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// The thinking depth for this node's worker (`off` … `max`).
+    ///
+    /// Unlike `model`, this **does** override the parent session rather than being
+    /// inherited alongside it. The reason the two differ: naming a model usually
+    /// does not mean naming a depth (the same model runs at several), but "this
+    /// job is mechanical" is a judgement about the **task** and has to be sayable
+    /// on its own. A worker that edits three files does not need to think, and a
+    /// session set to `max` should not silently pay for that on every node.
+    ///
+    /// `None` means "inherit the parent session's level".
+    pub thinking: Option<String>,
     /// Whether the node runs in its own working directory.
     ///
     /// Without it, parallel nodes share one directory and have to be given
@@ -89,14 +105,28 @@ pub struct Node {
     pub expect_file: Option<String>,
     /// After the child exits successfully, this shell command must exit 0.
     pub verify: Option<String>,
-    /// The saved session the node's worker works in.
+    /// **Ignored.** Kept only so an existing plan still parses.
     ///
-    /// Naming one makes a later node with the same name **resume** that worker:
-    /// its history, and what it already learned about the repository, survive an
-    /// earlier turn. Without it every node starts from nothing.
+    /// This used to let a node resume a worker by name, so a later node inherited
+    /// an earlier one's history. That is now forbidden: the engine always names
+    /// the worker `<taskId>-<nodeId>` (see [`crate::dispatch`]), one session per
+    /// node.
     ///
-    /// The host allows one `rpi` process per session file, so a name also keeps
-    /// two nodes from working the same session at once.
+    /// Why revoking it matters more than it looks — reusing one worker across
+    /// nodes fails three ways, and the second is the dangerous one:
+    ///
+    /// 1. carry-over: the worker applies the previous node's assumptions;
+    /// 2. **acceptance drift**: [`crate::prompt::worker_prompt`] writes the node's
+    ///    `expect_file` / `verify` into the prompt, so a resumed worker still has
+    ///    the *previous* node's criteria in context. It can pass checks while
+    ///    producing the wrong artifact, and the artifact exists, so nothing looks
+    ///    broken;
+    /// 3. the stale warning is only a warning, and only checked when `plan` is
+    ///    called with `set`/`update` — by the time it fires the context is already
+    ///    mixed.
+    ///
+    /// Passing a name is not an error; it is overwritten and the caller is told so
+    /// in the tool result.
     pub session: Option<String>,
     pub max_turns: u64,
     pub timeout_secs: u64,
@@ -141,6 +171,22 @@ impl Node {
         let role = string_field(value, "role");
         let provider = string_field(value, "provider");
         let model = string_field(value, "model");
+        // `thinking` is validated rather than free-form: an unknown level would be
+        // forwarded to the child as a `--thinking` flag the host rejects, and the
+        // failure would surface as "the worker never started".
+        let thinking = match string_field(value, "thinking") {
+            Some(level) => {
+                let level = level.trim().to_ascii_lowercase();
+                if !THINKING_LEVELS.contains(&level.as_str()) {
+                    return Err(format!(
+                        "node `{id}` thinking must be one of {}",
+                        THINKING_LEVELS.join(", ")
+                    ));
+                }
+                Some(level)
+            }
+            None => None,
+        };
         let expect_file = string_field(value, "expectFile");
         let verify = string_field(value, "verify");
         let session = string_field(value, "session");
@@ -167,6 +213,7 @@ impl Node {
             role,
             provider,
             model,
+            thinking,
             isolation,
             expect_file,
             verify,
@@ -187,6 +234,7 @@ impl Node {
             "role": self.role,
             "provider": self.provider,
             "model": self.model,
+            "thinking": self.thinking,
             "isolation": self.isolation,
             "expectFile": self.expect_file,
             "verify": self.verify,

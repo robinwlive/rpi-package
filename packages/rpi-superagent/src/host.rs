@@ -97,20 +97,35 @@ impl Selection {
         &self,
         explicit_provider: Option<&str>,
         explicit_model: Option<&str>,
+        explicit_thinking: Option<&str>,
     ) -> Selection {
+        // `thinking` is resolved on its own, not inside the "did the node name a
+        // model" branch. A node that keeps the parent's model but wants no
+        // thinking is the common case — a worker editing three files does not need
+        // to think, and a `max` session should not pay for it on every node.
+        //
+        // This is deliberately the **opposite** rule from model/provider below:
+        // naming a model usually does not mean naming a depth (one model runs at
+        // several), so an explicit model still inherits the depth; but "this job
+        // is mechanical" is a judgement about the task and must be sayable alone.
+        let thinking = explicit_thinking
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .or_else(|| self.thinking.clone());
         if explicit_provider.is_some() || explicit_model.is_some() {
             return Selection {
                 provider: explicit_provider.map(str::to_string),
                 model: explicit_model.map(str::to_string),
-                // Naming a model does not name a thinking depth: the level is
-                // still this session's own, so it is inherited.
-                thinking: self.thinking.clone(),
+                thinking,
                 // The executable is not part of the binding choice; it travels
                 // with it so every worker of a wave uses the same one.
                 exe: self.exe.clone(),
             };
         }
-        self.clone()
+        Selection {
+            thinking,
+            ..self.clone()
+        }
     }
 
     pub(crate) fn provider(&self) -> Option<&str> {
@@ -393,6 +408,46 @@ mod tests {
         }
         args.iter().any(|arg| !arg.starts_with('-'))
     }
+    /// A node's thinking level overrides the parent session's.
+    ///
+    /// This is the opposite rule from model/provider, on purpose: naming a model
+    /// usually does not name a depth, so an explicit model still inherits it. But
+    /// "this job is mechanical" is a judgement about the *task*, and a `max`
+    /// session must be able to run a worker at `off` without also changing its
+    /// model.
+    #[test]
+    fn a_node_thinking_level_overrides_the_sessions() {
+        let parent = Selection {
+            provider: Some("magpie".into()),
+            model: Some("deepseek-v4.1-flash".into()),
+            thinking: Some("max".into()),
+            exe: None,
+        };
+        // Explicit level wins, and it does not require naming a model.
+        assert_eq!(
+            parent.effective(None, None, Some("off")).thinking.as_deref(),
+            Some("off")
+        );
+        // Nothing named: inherits.
+        assert_eq!(
+            parent.effective(None, None, None).thinking.as_deref(),
+            Some("max")
+        );
+        // Blank is treated as absent, not as an empty level.
+        assert_eq!(
+            parent.effective(None, None, Some("  ")).thinking.as_deref(),
+            Some("max")
+        );
+        // Naming only a model still inherits the depth (the model rule is unchanged).
+        assert_eq!(
+            parent
+                .effective(None, Some("gpt-6-astra"), None)
+                .thinking
+                .as_deref(),
+            Some("max")
+        );
+    }
+
 
     #[test]
     fn a_print_run_is_one_shot() {
@@ -462,10 +517,10 @@ mod tests {
             exe: None,
         };
         // Nothing named: inherit the whole binding.
-        assert_eq!(parent.effective(None, None), parent);
+        assert_eq!(parent.effective(None, None, None), parent);
         // Both named: pass through untouched.
         assert_eq!(
-            parent.effective(Some("openai"), Some("gpt-6-astra")),
+            parent.effective(Some("openai"), Some("gpt-6-astra"), None),
             Selection {
                 provider: Some("openai".into()),
                 model: Some("gpt-6-astra".into()),
@@ -475,7 +530,7 @@ mod tests {
         );
         // Half named: only that half is passed, so the child resolves the rest.
         assert_eq!(
-            parent.effective(Some("deepseek"), None),
+            parent.effective(Some("deepseek"), None, None),
             Selection {
                 provider: Some("deepseek".into()),
                 model: None,
@@ -484,7 +539,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parent.effective(None, Some("deepseek-v4-pro")),
+            parent.effective(None, Some("deepseek-v4-pro"), None),
             Selection {
                 provider: None,
                 model: Some("deepseek-v4-pro".into()),
