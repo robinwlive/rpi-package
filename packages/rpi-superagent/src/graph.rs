@@ -20,6 +20,13 @@ pub const MAX_TIMEOUT_SECS: u64 = 1800;
 /// prototype this package follows, so the two agree on where "this has run away"
 /// begins.
 pub const MAX_TIER: u32 = 8;
+
+/// The shape version of [`Graph::to_details`].
+///
+/// A queue is durable, so a plan can outlive the code that wrote it. Written into
+/// the details so a reader can tell an old plan from a corrupt one: without it,
+/// both look like "a field is missing", and the wrong guess loses work.
+pub const DETAILS_VERSION: u32 = 1;
 pub const MAX_TASK_BYTES: usize = 20_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +244,7 @@ impl Graph {
 
     pub fn to_details(&self) -> Value {
         json!({
+            "v": DETAILS_VERSION,
             "nodes": self.nodes.iter().map(Node::to_value).collect::<Vec<_>>(),
             "taskId": self.task_id,
             "tier": self.tier,
@@ -260,6 +268,17 @@ impl Graph {
     /// A node's `result` is kept, so a wave that is half done keeps the output of
     /// the half that is finished.
     pub fn from_details(value: &Value) -> Result<Graph, String> {
+        // A plan from a newer version is refused rather than half-read: a shape
+        // this code does not know may mean something different, and running a
+        // guessed version of it is worse than saying so.
+        if let Some(version) = value.get("v").and_then(Value::as_u64) {
+            if version > u64::from(DETAILS_VERSION) {
+                return Err(format!(
+                    "this plan was written by a newer version (shape {version}, this code reads \
+                     {DETAILS_VERSION}); upgrade the package or re-create the plan"
+                ));
+            }
+        }
         let nodes = value
             .get("nodes")
             .ok_or("details need a `nodes` array")?;
@@ -667,6 +686,33 @@ mod tests {
         assert!(g.tier >= MAX_TIER);
         g.tier = MAX_TIER - 1;
         assert!(g.tier < MAX_TIER, "one generation below still runs");
+    }
+
+    #[test]
+    fn a_newer_plan_shape_is_refused_rather_than_guessed() {
+        // A durable queue can hold a plan written by newer code. Running a guessed
+        // version of it is worse than saying the shape is unknown.
+        let details = json!({
+            "v": DETAILS_VERSION + 1,
+            "nodes": [{"id": "a", "task": "x"}],
+            "taskId": null
+        });
+        let error = Graph::from_details(&details).unwrap_err();
+        assert!(error.contains("newer version"), "got: {error}");
+    }
+
+    #[test]
+    fn an_older_plan_without_a_version_still_loads() {
+        // Plans written before the version field existed are shape 0, and this
+        // code reads shape 1 as the same thing.
+        let details = json!({"nodes": [{"id": "a", "task": "x"}], "taskId": null});
+        assert!(Graph::from_details(&details).is_ok());
+    }
+
+    #[test]
+    fn the_details_carry_their_version() {
+        let g = graph(json!([{"id": "a", "task": "x"}]));
+        assert_eq!(g.to_details()["v"], json!(DETAILS_VERSION));
     }
 
     #[test]
