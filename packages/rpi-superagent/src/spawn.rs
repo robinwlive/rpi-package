@@ -964,9 +964,22 @@ pub(crate) fn auto_answer(ui: &serde_json::Value) -> Option<String> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // The "are you done / may I continue" family. Matched on the question text
-    // because that is all a dialog gives us.
+    // The "may I continue / is this good enough" family. Matched on the question
+    // text because that is all a dialog gives us.
+    //
+    // ⚠️ **Both languages.** A worker writes its question in whatever language the
+    // task was written in, and this project's tasks are mostly Chinese. Matching
+    // only English would mean every Chinese task's proceed-question falls through
+    // to `cancelled` — the worker stops, the node is recorded failed, and the only
+    // visible cause is "it asked something". That is a silent extra run, not an
+    // error, which makes it easy to never notice.
+    //
+    // Chinese has no word boundaries, so `contains` is already the right test —
+    // but it also means a short word can match inside a longer unrelated one.
+    // Everything here is a full phrase for that reason (「继续吗」 rather than
+    // 「继续」, which would also match 「不要继续」).
     const PROCEED: &[&str] = &[
+        // English
         "continue",
         "proceed",
         "go ahead",
@@ -976,7 +989,56 @@ pub(crate) fn auto_answer(ui: &serde_json::Value) -> Option<String> {
         "is this ok",
         "are you ready",
         "shall i continue",
+        // 中文（带「吗 / 么 / 呢」的是问句；不带的是祈使句，不在此列）
+        "可以继续",
+        "能否继续",
+        "是否继续",
+        "继续吗",
+        "继续么",
+        "要继续",
+        "可以吗",
+        "行吗",
+        "对吗",
+        "好不好",
+        "是否可以",
+        "是否可行",
+        "可以开始",
+        "就这样",
+        "没问题吧",
     ];
+    // ⚠️ **否定词优先判定**：中文没有词边界，「不要继续」里含「要继续」，
+    // 只看 PROCEED 会把它答成 yes —— 恰好是相反的意思。
+    //
+    // 所以先扫否定词，命中就直接拒绝代答（交给 cancelled）。代价是
+    // 「不要紧，继续吧」这种双重否定也会被拒，那没什么损失：多一次节点运行，
+    // 比答反了强 —— 答反了节点会报成功，没有人再回头看它。
+    const NEGATIONS: &[&str] = &[
+        // 中文
+        "不要",
+        "不用",
+        "不必",
+        "不需要",
+        "不能",
+        "不可",
+        "不行",
+        "禁止",
+        "停止",
+        "取消",
+        // ⚠️ 不要加「别」：它太短，会误伤「别的问题没有了，可以继续吗」
+        // 「这个方案别处见过」这类正常问句。宁可放过一个真否定（多一次节点
+        // 运行），也不要让常见问句永远答不上。
+        // English
+        "don't",
+        "do not",
+        "not yet",
+        "stop",
+        "cancel",
+        "never",
+    ];
+    if NEGATIONS.iter().any(|n| question.contains(n)) {
+        return None;
+    }
+
     if matches!(kind, "confirm" | "boolean" | "") && PROCEED.iter().any(|p| question.contains(p)) {
         return Some("yes".into());
     }
@@ -1241,6 +1303,56 @@ mod tests {
         assert_eq!(auto_answer(&ui).as_deref(), Some("yes"));
         let ui = serde_json::json!({"kind": "confirm", "message": "May I proceed with the edit?"});
         assert_eq!(auto_answer(&ui).as_deref(), Some("yes"));
+    }
+
+    /// 中文的「可以继续吗」也要能答。
+    ///
+    /// 这个项目的任务大多用中文写，worker 也就用中文问。只匹配英文的话，
+    /// 每个中文任务的 proceed 问题都会掉到 `cancelled` —— 节点被记成失败、
+    /// 多花一次运行，而唯一的线索是「它问了点什么」。那是静默的额外开销，
+    /// 不是报错，所以最容易一直没人发现。
+    #[test]
+    fn a_chinese_proceed_question_is_answered_yes() {
+        for message in [
+            "可以继续吗？",
+            "我可以继续吗",
+            "是否继续执行",
+            "要继续吗",
+            "这样做对吗？",
+            "没问题吧",
+            "可以开始吗",
+        ] {
+            let ui = serde_json::json!({"kind": "confirm", "message": message});
+            assert_eq!(auto_answer(&ui).as_deref(), Some("yes"), "应当代答: {message}");
+        }
+    }
+
+    /// 中文没有词边界，所以关键词必须是**整句短语** —— 短词会误中反向表达。
+    ///
+    /// 「不要继续」里含「继续」，若关键词是「继续」就会被答成 yes，
+    /// 而它恰好是相反的意思。这条测试就是钉住这个原则。
+    #[test]
+    fn a_chinese_negation_is_never_answered_yes() {
+        for message in ["不要继续", "不用继续", "停止继续运行"] {
+            let ui = serde_json::json!({"kind": "confirm", "message": message});
+            assert_eq!(auto_answer(&ui), None, "不该代答: {message}");
+        }
+    }
+
+    /// 否定词不能太短，否则会吃掉正常问句。
+    ///
+    /// 「别」曾经在列表里，于是「别的问题没有了，可以继续吗」被判成否定、
+    /// 永远答不上。放过一个真否定的代价是多跑一次节点；误伤常见问句的代价是
+    /// 那类任务**永远**多跑一次。
+    #[test]
+    fn a_short_word_in_a_normal_question_does_not_block_the_answer() {
+        for message in [
+            "别的问题没有了，可以继续吗",
+            "这个方案别处见过，可以继续吗",
+        ] {
+            let ui = serde_json::json!({"kind": "confirm", "message": message});
+            assert_eq!(auto_answer(&ui).as_deref(), Some("yes"), "不该误判: {message}");
+        }
     }
 
     /// 选一个方案是决策，不是复述 —— 引擎不能替它拍板。
