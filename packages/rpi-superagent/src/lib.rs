@@ -90,6 +90,52 @@ pub(crate) fn graph_task_id() -> Option<String> {
         .clone()
 }
 
+/// The shared graph's current details.
+///
+/// Used after a wave to queue the next one from the state the wave left behind,
+/// rather than the state it started from.
+pub(crate) fn graph_details() -> Option<serde_json::Value> {
+    let guard = graph_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if guard.graph.nodes.is_empty() {
+        return None;
+    }
+    Some(guard.graph.to_details())
+}
+
+/// The next wave of `graph`, if any node is ready for it.
+///
+/// A plan that takes more than one wave needs each wave to queue the next: the
+/// queue's row is per task, so retiring it after the first wave would strand every
+/// node the first wave unblocked.
+pub(crate) fn next_ready_wave(
+    graph: &serde_json::Value,
+    max_parallel: usize,
+    binding: &effects::Binding,
+    session: Option<&str>,
+    rpi_exe: Option<&str>,
+) -> Option<effects::Effect> {
+    let rebuilt = graph::Graph::from_details(graph).ok()?;
+    let ready = rebuilt.ready();
+    if ready.is_empty() {
+        return None;
+    }
+    // The binding, session and executable are carried forward, not re-derived:
+    // this wave is a continuation of the last one, and everything the daemon
+    // cannot look up has to keep travelling with it.
+    let task_id = rebuilt.task_id.clone()?;
+    Some(effects::Effect::Launch {
+        task_id,
+        nodes: ready,
+        max_parallel,
+        binding: binding.clone(),
+        session: session.map(str::to_string),
+        graph: Some(graph.clone()),
+        rpi_exe: rpi_exe.map(str::to_string),
+    })
+}
+
 /// Install a reconstructed graph as the shared one.
 ///
 /// Used by the background pass: the graph it is running lives in the effect log,

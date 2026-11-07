@@ -547,6 +547,49 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_wave_plan_queues_its_next_wave() {
+        // A DAG that takes more than one wave: the queue's row is per task, so
+        // retiring it after the first wave would strand every node that wave
+        // unblocked. `next_ready_wave` is what keeps the plan moving.
+        let graph = serde_json::json!({
+            "v": crate::graph::DETAILS_VERSION,
+            "taskId": "T1",
+            "tier": 0,
+            "nodes": [
+                {"id": "a", "task": "first", "status": "done"},
+                {"id": "b", "task": "second", "deps": ["a"], "status": "pending"}
+            ]
+        });
+        let next = crate::next_ready_wave(
+            &graph,
+            4,
+            &Binding::default(),
+            None,
+            None,
+        )
+        .expect("b is ready now that a is done");
+        match next {
+            Effect::Launch { nodes, task_id, .. } => {
+                assert_eq!(task_id, "T1");
+                assert_eq!(nodes, vec!["b".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finished_plan_queues_nothing() {
+        // No ready node means no next wave; queueing an empty one would spin.
+        let graph = serde_json::json!({
+            "v": crate::graph::DETAILS_VERSION,
+            "taskId": "T1",
+            "tier": 0,
+            "nodes": [{"id": "a", "task": "only", "status": "done"}]
+        });
+        assert!(crate::next_ready_wave(&graph, 4, &Binding::default(), None, None).is_none());
+    }
+
+    #[test]
     fn backoff_doubles_and_caps() {
         use crate::effects::Kind;
         let first = backoff_ms(Kind::Relay, 0);

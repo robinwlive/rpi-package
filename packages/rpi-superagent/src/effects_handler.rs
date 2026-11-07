@@ -165,6 +165,19 @@ fn run_launch(
             // this process's memory would be invisible to a daemon writing the
             // log, and the two would keep re-queueing each other.
             let _ = nodes;
+            // A DAG usually takes several waves: this one ran everything that was
+            // ready, and the rest are now unblocked. Queueing the next wave here is
+            // what keeps a whole plan moving; without it the row retires after the
+            // first wave and the remaining nodes never run.
+            // The graph *as it now stands*, not as it was queued: this wave marked
+            // its nodes done, and passing the original would queue a next wave that
+            // redoes them.
+            let current = crate::graph_details();
+            if let Some(next) = current.and_then(|current| {
+                crate::next_ready_wave(&current, max_parallel, binding, session, rpi_exe)
+            }) {
+                crate::effects().enqueue(next);
+            }
             relay(task_id, &summarize(&text))
         }
         Err(message) => {
