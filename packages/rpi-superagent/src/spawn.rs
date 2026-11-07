@@ -10,7 +10,7 @@
 //! would be parsed as a flag. Piped stdin becomes the initial prompt
 //! (`rpi-cli::app::build_initial_message`).
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -1010,10 +1010,9 @@ fn describe_ui(ui: &serde_json::Value) -> String {
 /// `EPIPE` is not fatal: the worker may have exited between our deciding to answer
 /// and the write landing. The exit status is what decides success, not this.
 ///
-/// Kept separate from [`write_stdin`] because the two differ in a way that matters:
-/// `write_stdin` **drops** the handle afterwards (closing the pipe), which is right
-/// for a one-shot `-p` run and wrong for rpc — the worker still needs the channel
-/// to receive answers.
+/// The handle stays open afterwards: in rpc mode the worker still needs the channel
+/// to receive answers. (The one-shot `-p` path used to drop it here, which closed the
+/// pipe and made answering impossible.)
 fn write_line(stdin: &mut Option<std::process::ChildStdin>, frame: &str) {
     use std::io::Write;
     let Some(handle) = stdin.as_mut() else {
@@ -1025,20 +1024,6 @@ fn write_line(stdin: &mut Option<std::process::ChildStdin>, frame: &str) {
     }
     let _ = handle.write_all(line.as_bytes());
     let _ = handle.flush();
-}
-
-fn write_stdin(mut stdin: Option<std::process::ChildStdin>, task: &str) {
-    // A child that never reads (or exits first) must not block the caller, so the
-    // write happens on its own thread; EPIPE is not fatal — the exit status is
-    // what decides success. Dropping the handle closes the pipe so the child
-    // observes EOF.
-    let task = task.to_owned();
-    std::thread::spawn(move || {
-        if let Some(stdin) = stdin.as_mut() {
-            let _ = stdin.write_all(task.as_bytes());
-            let _ = stdin.flush();
-        }
-    });
 }
 
 /// Collect an `rpc` worker's event stream into an [`RpcOutcome`].
@@ -1110,12 +1095,6 @@ pub(crate) fn spawn_reader<R: Read + Send + 'static>(
 /// Lines that fail to parse are kept as `noise` rather than dropped: a non-frame
 /// line usually means the host printed a diagnostic, and that is exactly what
 /// explains a worker that "ran but said nothing".
-pub(crate) fn spawn_event_reader<R: Read + Send + 'static>(
-    mut reader: R,
-) -> (Receiver<RpcOutcome>, JoinHandle<()>) {
-    spawn_event_reader_with(reader, |_| {})
-}
-
 /// Same as [`spawn_event_reader`], plus a hook for each dialog request as it
 /// arrives.
 ///
