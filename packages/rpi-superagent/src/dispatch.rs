@@ -625,7 +625,19 @@ pub(super) fn run_wave(
                         // A named session resumes that worker; its directory is
                         // passed explicitly so worker history never lands in the
                         // user's repository.
-                        let session_dir = crate::workspace::session_dir();
+                        // One directory per **task** (I5): two tasks in the same
+                        // project would otherwise share this folder, and the second
+                        // `find_session_id` would resume the first one's worker
+                        // history — or collide outright with "already open in
+                        // another rpi process".
+                        //
+                        // Task id rather than parent session id: a task belongs to
+                        // exactly one session (`superagent_plan` binds them), and it
+                        // is what is in scope here. Two sessions cannot share a task
+                        // id, so this separates parents just as well.
+                        let session_dir = crate::workspace::session_dir_for(
+                            graph.task_id.as_deref(),
+                        );
                         // The task arrives as data inside a fence, so text that
                         // reads like a command stays text. The fixed part comes
                         // first, which is also what lets two workers share a

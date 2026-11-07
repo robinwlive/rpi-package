@@ -49,6 +49,14 @@ pub const ENV_PROVIDER: &str = "RPI_PROVIDER";
 pub const ENV_MODEL: &str = "RPI_MODEL";
 pub const ENV_THINKING: &str = "RPI_THINKING";
 
+/// The Dash bridge's three switches, which a worker must not inherit.
+///
+/// `PI_DINGO_BRIDGE` is the switch; the other two are the parent session's
+/// credentials. The bridge starts only when all three are present, so removing
+/// the switch alone would be enough — but a `Command` inherits the whole
+/// environment, so all three are removed and nothing is left to leak.
+pub const BRIDGE_ENV: &[&str] = &["PI_DINGO_BRIDGE", "PI_DINGO_URL", "PI_DINGO_TOKEN"];
+
 /// How often the wait loop re-checks cancellation/timeout. Bounds how long a
 /// cancelled call can keep a child alive.
 pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
@@ -239,6 +247,14 @@ pub fn child_command_with_session(
     }
     if let Some(thinking) = thinking.filter(|value| !value.is_empty()) {
         command.env(ENV_THINKING, thinking);
+    }
+    // A worker must never carry the Dash bridge. It runs inside the parent's
+    // tmux pane, so it inherits `PI_DINGO_BRIDGE=on` plus the parent's URL and
+    // token — and would then register against Dash **as the parent**, evicting
+    // the parent's bridge (observed 2026-11-07). Dash guards against it too; the
+    // root fix is here.
+    for name in BRIDGE_ENV {
+        command.env_remove(name);
     }
     command
         // Hard turn ceiling enforced by the harness, not the model.
@@ -972,6 +988,15 @@ mod tests {
         assert_eq!(
             envs,
             vec![
+                // The bridge switches are explicitly **cleared** (I6). A `Command`
+                // inherits the parent's environment, and the parent runs inside a
+                // tmux pane that carries `PI_DINGO_BRIDGE=on` plus its URL and
+                // token. Inherited, the worker would load `pidingo.dylib` and
+                // register against Dash **with the parent's token**, repeatedly
+                // replacing the parent's bridge entry (observed 2026-11-07).
+                ("PI_DINGO_BRIDGE".to_string(), String::new()),
+                ("PI_DINGO_TOKEN".to_string(), String::new()),
+                ("PI_DINGO_URL".to_string(), String::new()),
                 (MAX_TURNS_ENV.to_string(), "7".to_string()),
                 (SUBAGENT_ENV.to_string(), "1".to_string()),
                 // A plan dispatched from a person's session is generation zero, so

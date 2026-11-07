@@ -29,18 +29,30 @@ const ROOT: &str = ".rpi/superagent-work";
 /// The directory that holds workers' saved sessions.
 const SESSION_ROOT: &str = ".rpi/superagent-sessions";
 
-/// Where a worker's saved session lives.
+/// Where a worker's saved session lives, for a parent session.
 ///
 /// Passed to the child explicitly because the host's default would be the
 /// parent project's `.rpi/sessions/`, mixing worker history into the user's
-/// repository. One directory here holds every worker's session; each session
-/// is named after the node or Ticket that owns it, so no two share a file.
+/// repository.
+///
+/// **The parent session id is part of the path.** One directory for the whole
+/// project means two parent sessions in the same project each write
+/// `<name>.jsonl` under the same folder: the second `find_session_id` resolves
+/// the *first* parent's file and resumes a stranger's history — or the two
+/// collide outright with "already open in another rpi process". One directory
+/// per parent keeps them physically apart.
+///
+/// With no parent id there is nothing to separate, so the old flat directory is
+/// used: the behaviour is unchanged for callers that never had an id.
 ///
 /// Returns `None` when there is no usable working directory; the caller then
 /// leaves the child ephemeral.
-pub fn session_dir() -> Option<PathBuf> {
+pub fn session_dir_for(parent_session_id: Option<&str>) -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
-    let dir = cwd.join(SESSION_ROOT);
+    let dir = match parent_session_id.map(sanitize).filter(|id| !id.is_empty()) {
+        Some(parent) => cwd.join(SESSION_ROOT).join(parent),
+        None => cwd.join(SESSION_ROOT),
+    };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -206,6 +218,29 @@ mod tests {
     #[test]
     fn run_ids_differ_between_calls() {
         assert_ne!(run_id("r"), run_id("r"));
+    }
+
+    /// Two parent sessions in one project must not share a session directory,
+    /// or one would resume the other's worker history.
+    #[test]
+    fn a_parent_session_gets_its_own_session_directory() {
+        let dir = session_dir_for(Some("abc")).expect("a parent id has a directory");
+        assert!(
+            dir.ends_with("superagent-sessions/abc"),
+            "the parent id must be a directory level: {dir:?}"
+        );
+    }
+
+    /// No parent id: the flat directory every earlier worker used.
+    #[test]
+    fn no_parent_session_falls_back_to_the_flat_directory() {
+        let dir = session_dir_for(None).expect("no parent id still has a directory");
+        assert!(
+            dir.ends_with("superagent-sessions"),
+            "the old path must be unchanged: {dir:?}"
+        );
+        // An id that sanitizes to nothing is not a directory level either.
+        assert_eq!(Some(dir), session_dir_for(Some("//")));
     }
 
     /// One session per node, and the name is the engine's, not the caller's.
