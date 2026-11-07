@@ -566,14 +566,27 @@ pub fn run_child_reporting(
     // outwait the deadline: a descendant that inherits the pipe and outlives the
     // direct child must not extend the call.
     // stdout is a JSONL event stream (rpc); stderr stays raw text.
-    let out_reader = child.stdout.take().map(spawn_event_reader);
+    //
+    // The question hook needs stdin, which is created below — so it is installed
+    // after `stdin` exists. The reader thread starts first so no early question is
+    // missed; questions that arrive before the hook is wired are still collected in
+    // the outcome (they just cannot be auto-answered).
+    let (question_tx, question_rx) = mpsc::channel::<Question>();
+    let out_reader = child.stdout.take().map(|stdout| {
+        spawn_event_reader_with(stdout, move |question| {
+            // Best-effort: if the main loop is gone, the worker is gone too.
+            let _ = question_tx.send(question);
+        })
+    });
     let err_reader = child.stderr.take().map(spawn_reader);
 
-    // Writing is part of the bounded lifecycle too: a child that never reads
-    // stdin must not make the tool hang before the wait loop starts.
-    // One prompt frame. In rpc mode a bare text line is not a command, so the
-    // worker would wait forever; see `prompt_frame`.
-    write_stdin(child.stdin.take(), &prompt_frame(task));
+    // **stdin stays open.** In rpc mode the channel is bidirectional: a worker that
+    // asks a question writes `ui_dialog_request` and then blocks reading stdin for
+    // the answer. The old code did `child.stdin.take()` and dropped the handle after
+    // the prompt, which closes the pipe — so even a handler that wanted to answer
+    // could not, and the worker waited until the wall clock killed it.
+    let mut stdin = child.stdin.take();
+    write_line(&mut stdin, &prompt_frame(task));
 
     // Wait in slices so cancellation and the wall-clock deadline are both observed
     // while the child is still running.
@@ -585,6 +598,30 @@ pub fn run_child_reporting(
         if Instant::now() >= deadline {
             kill_and_reap(&mut child, &tree);
             return Err(format!("subagent timed out after {timeout_secs}s"));
+        }
+        // Answer whatever the worker asked while we wait. This is the whole point
+        // of keeping stdin open: a question that is not answered here becomes a
+        // worker that dies at the deadline with its work unfinished.
+        while let Ok(question) = question_rx.try_recv() {
+            match auto_answer(&question.ui) {
+                Some(answer) => {
+                    write_line(&mut stdin, &dialog_response_frame(&question.request_id, &answer));
+                }
+                None => {
+                    // Not ours to decide. Unblock the worker with a cancellation
+                    // rather than letting it hang: it will finish its turn and
+                    // report the refusal, which is far more useful than a timeout.
+                    write_line(
+                        &mut stdin,
+                        &serde_json::json!({
+                            "type": "ui_dialog_response",
+                            "requestId": question.request_id,
+                            "cancelled": true,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
         }
         let slice = deadline
             .saturating_duration_since(Instant::now())
@@ -771,6 +808,17 @@ pub(crate) fn prompt_frame(task: &str) -> String {
     .to_string()
 }
 
+/// One question a worker asked mid-run, as it arrives.
+///
+/// Carried separately from [`RpcOutcome`] because it must be delivered **while the
+/// worker is still blocked**, not collected for the final result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Question {
+    pub request_id: String,
+    /// The raw `ui` payload, for [`auto_answer`].
+    pub ui: serde_json::Value,
+}
+
 /// What an `rpc` worker's stdout yielded, after folding its event stream.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RpcOutcome {
@@ -792,6 +840,15 @@ pub struct RpcOutcome {
 /// contract with `rpi`, and a unit test is the only thing that will notice when
 /// upstream renames a field.
 pub fn fold_rpc_event(line: &str, out: &mut RpcOutcome) -> bool {
+    fold_rpc_event_with(line, out, &mut |_| {})
+}
+
+/// [`fold_rpc_event`] plus a hook that fires for each question as it is parsed.
+pub fn fold_rpc_event_with(
+    line: &str,
+    out: &mut RpcOutcome,
+    on_question: &mut dyn FnMut(Question),
+) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
         return false;
     };
@@ -832,6 +889,14 @@ pub fn fold_rpc_event(line: &str, out: &mut RpcOutcome) -> bool {
                 .get("requestId")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
+            // Deliver it now: the worker is blocked on this question, and the
+            // answer has to go back on stdin before it will move again.
+            if !id.is_empty() {
+                on_question(Question {
+                    request_id: id.to_string(),
+                    ui: value.get("ui").cloned().unwrap_or(serde_json::Value::Null),
+                });
+            }
             let question = value
                 .get("ui")
                 .map(describe_ui)
@@ -868,6 +933,66 @@ fn message_text(message: &serde_json::Value) -> String {
     }
 }
 
+/// What the engine can answer on a worker's behalf.
+///
+/// ## Why an answerer exists at all
+///
+/// A worker that stops to ask has two possible futures: it waits (and dies on the
+/// wall clock, wasting the run), or something answers. The orchestrating **model**
+/// cannot answer — this whole call is synchronous and the model is the party
+/// blocked inside it. So either the engine answers a narrow class of questions, or
+/// nobody does.
+///
+/// ## What it is allowed to answer
+///
+/// Only questions whose answer is **already decided by the node's own acceptance
+/// criteria** — the "may I proceed" / "is this good enough" family. Those are
+/// re-statements of what the plan already said, so answering them cannot change
+/// the goal. Everything else (which library, what to delete, which of two designs)
+/// changes the outcome and must go back to the caller as an unanswered question.
+///
+/// This is deliberately narrow. A wrong auto-answer is worse than a failed node:
+/// the node reports success, and nobody looks at it again.
+pub(crate) fn auto_answer(ui: &serde_json::Value) -> Option<String> {
+    // Only confirmation-style dialogs have a safe answer. A `select` between
+    // options is a decision, and a `text` prompt wants content we do not have.
+    let kind = ui.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+    let question = ui
+        .get("message")
+        .or_else(|| ui.get("question"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // The "are you done / may I continue" family. Matched on the question text
+    // because that is all a dialog gives us.
+    const PROCEED: &[&str] = &[
+        "continue",
+        "proceed",
+        "go ahead",
+        "shall i proceed",
+        "may i proceed",
+        "is that ok",
+        "is this ok",
+        "are you ready",
+        "shall i continue",
+    ];
+    if matches!(kind, "confirm" | "boolean" | "") && PROCEED.iter().any(|p| question.contains(p)) {
+        return Some("yes".into());
+    }
+    None
+}
+
+/// Build the `ui_dialog_response` frame for one request.
+pub(crate) fn dialog_response_frame(request_id: &str, answer: &str) -> String {
+    serde_json::json!({
+        "type": "ui_dialog_response",
+        "requestId": request_id,
+        "answer": answer,
+    })
+    .to_string()
+}
+
 /// A one-line description of a dialog request, for the "unanswered" report.
 fn describe_ui(ui: &serde_json::Value) -> String {
     for key in ["message", "prompt", "title", "text"] {
@@ -878,6 +1003,28 @@ fn describe_ui(ui: &serde_json::Value) -> String {
         }
     }
     ui.to_string()
+}
+
+/// Write one JSONL frame to a worker's stdin, best-effort.
+///
+/// `EPIPE` is not fatal: the worker may have exited between our deciding to answer
+/// and the write landing. The exit status is what decides success, not this.
+///
+/// Kept separate from [`write_stdin`] because the two differ in a way that matters:
+/// `write_stdin` **drops** the handle afterwards (closing the pipe), which is right
+/// for a one-shot `-p` run and wrong for rpc — the worker still needs the channel
+/// to receive answers.
+fn write_line(stdin: &mut Option<std::process::ChildStdin>, frame: &str) {
+    use std::io::Write;
+    let Some(handle) = stdin.as_mut() else {
+        return;
+    };
+    let mut line = frame.to_owned();
+    if !line.ends_with('\n') {
+        line.push('\n');
+    }
+    let _ = handle.write_all(line.as_bytes());
+    let _ = handle.flush();
 }
 
 fn write_stdin(mut stdin: Option<std::process::ChildStdin>, task: &str) {
@@ -966,6 +1113,24 @@ pub(crate) fn spawn_reader<R: Read + Send + 'static>(
 pub(crate) fn spawn_event_reader<R: Read + Send + 'static>(
     mut reader: R,
 ) -> (Receiver<RpcOutcome>, JoinHandle<()>) {
+    spawn_event_reader_with(reader, |_| {})
+}
+
+/// Same as [`spawn_event_reader`], plus a hook for each dialog request as it
+/// arrives.
+///
+/// The hook runs **on the reader thread, before the worker can be answered** —
+/// that is what lets the caller write the answer back while the worker is still
+/// blocked on it. Doing this after the stream ends would be too late: the worker
+/// is waiting *now*.
+pub(crate) fn spawn_event_reader_with<R, F>(
+    mut reader: R,
+    mut on_question: F,
+) -> (Receiver<RpcOutcome>, JoinHandle<()>)
+where
+    R: Read + Send + 'static,
+    F: FnMut(Question) + Send + 'static,
+{
     let (sender, receiver) = mpsc::channel();
     let handle = std::thread::spawn(move || {
         let mut outcome = RpcOutcome::default();
@@ -995,7 +1160,7 @@ pub(crate) fn spawn_event_reader<R: Read + Send + 'static>(
                     }
                     while let Some(pos) = pending.find('\n') {
                         let line: String = pending.drain(..=pos).collect();
-                        fold_rpc_event(&line, &mut outcome);
+                        fold_rpc_event_with(&line, &mut outcome, &mut on_question);
                     }
                     if raw_bytes > MAX_OUTPUT_BYTES * 8 {
                         break;
@@ -1084,6 +1249,65 @@ mod tests {
         assert_eq!(out.questions.len(), 1);
         assert!(out.questions[0].contains("requestId=pidingo:1"));
         assert!(out.questions[0].contains("which file?"));
+    }
+
+    // ── 提问的自动应答（B6 第二部分）──────────────────────────────
+
+    /// 「可以继续吗」这类问题由引擎代答 yes。
+    ///
+    /// 依据是节点自己的验收条件已经说过"什么算完"，再问一遍是复述，不会改变目标。
+    #[test]
+    fn a_proceed_question_is_answered_yes() {
+        let ui = serde_json::json!({"kind": "confirm", "message": "Shall I proceed?"});
+        assert_eq!(auto_answer(&ui).as_deref(), Some("yes"));
+        let ui = serde_json::json!({"kind": "confirm", "message": "May I proceed with the edit?"});
+        assert_eq!(auto_answer(&ui).as_deref(), Some("yes"));
+    }
+
+    /// 选一个方案是决策，不是复述 —— 引擎不能替它拍板。
+    ///
+    /// 答错的代价比节点失败更糟：节点会报成功，而没有人再回头看了一眼。
+    #[test]
+    fn a_choice_is_never_auto_answered() {
+        for ui in [
+            serde_json::json!({"kind": "select", "message": "Which library?", "options": ["a", "b"]}),
+            serde_json::json!({"kind": "text", "message": "What should the file contain?"}),
+            serde_json::json!({"kind": "confirm", "message": "Delete the old migrations?"}),
+        ] {
+            assert_eq!(auto_answer(&ui), None, "不该替人决策: {ui}");
+        }
+    }
+
+    /// 空消息的 confirm 也不能瞎答。
+    #[test]
+    fn a_bare_confirm_gets_no_answer() {
+        assert_eq!(auto_answer(&serde_json::json!({"kind": "confirm"})), None);
+    }
+
+    /// 应答帧的形状与 rpi 的 rpc 协议一致。
+    #[test]
+    fn the_response_frame_matches_the_rpc_shape() {
+        let line = dialog_response_frame("pidingo:7", "yes");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["type"], "ui_dialog_response");
+        assert_eq!(value["requestId"], "pidingo:7");
+        assert_eq!(value["answer"], "yes");
+    }
+
+    /// 提问在**解析当时**回调出去，而不是等流结束。
+    ///
+    /// 这是能回答它的前提：worker 正阻塞在这一帧上，晚一步它就已经超时了。
+    #[test]
+    fn a_question_is_delivered_as_it_is_parsed() {
+        let mut out = RpcOutcome::default();
+        let mut seen: Vec<Question> = Vec::new();
+        let line = r#"{"type":"ui_dialog_request","requestId":"pidingo:1","ui":{"kind":"confirm","message":"Shall I proceed?"}}"#;
+        fold_rpc_event_with(line, &mut out, &mut |q| seen.push(q));
+
+        assert_eq!(seen.len(), 1, "回调必须当场触发");
+        assert_eq!(seen[0].request_id, "pidingo:1");
+        // 同一帧仍然进 outcome，供最终报告用。
+        assert_eq!(out.questions.len(), 1);
     }
 
     /// Frames we do not act on must not be mistaken for data.
