@@ -357,8 +357,18 @@ pub fn fold(lines: &[Line]) -> Vec<Row> {
 /// queue works in `Instant`s so a clock change cannot make a row never due.
 /// Anything already past becomes "now".
 fn due_instant(due_at_ms: u64, now_ms: u64) -> std::time::Instant {
-    let delta_ms = due_at_ms.saturating_sub(now_ms);
-    std::time::Instant::now() + std::time::Duration::from_millis(delta_ms)
+    // A row that is already overdue keeps how long it has been overdue, rather than
+    // being flattened to `now`. The daemon uses that age to decide whether an
+    // abandoned row is safe to adopt, and "just became due" is indistinguishable
+    // from "a live host is about to run it".
+    if due_at_ms >= now_ms {
+        std::time::Instant::now() + std::time::Duration::from_millis(due_at_ms - now_ms)
+    } else {
+        let overdue = now_ms - due_at_ms;
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(overdue))
+            .unwrap_or_else(std::time::Instant::now)
+    }
 }
 
 /// The append-only log for one owner.
@@ -711,6 +721,28 @@ mod tests {
         let rows = Log::open(&dir, "s1").unwrap().load();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].effect.key(), "live");
+    }
+
+    #[test]
+    fn an_overdue_row_keeps_its_age() {
+        // The daemon adopts a row only after it has been due for a while, to avoid
+        // racing a live host. If an overdue row were flattened to "due now", an
+        // abandoned row would look like one about to be picked up — and never be.
+        let now = now_ms();
+        let overdue_by = 60_000u64;
+        let due = due_instant(now.saturating_sub(overdue_by), now);
+        let age = due.elapsed().as_millis() as u64;
+        assert!(
+            age >= overdue_by - 5_000,
+            "an overdue row should read as ~{overdue_by}ms old, got {age}ms"
+        );
+    }
+
+    #[test]
+    fn a_future_row_still_lies_ahead() {
+        let now = now_ms();
+        let due = due_instant(now + 60_000, now);
+        assert!(due > std::time::Instant::now(), "a future row is not yet due");
     }
 
     #[test]

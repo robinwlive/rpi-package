@@ -36,6 +36,21 @@ const LOCK_FILE: &str = ".lock";
 /// How often an idle daemon looks for work.
 pub const TICK: Duration = Duration::from_secs(2);
 
+/// How long a row must sit untouched before the daemon will run it.
+///
+/// The in-process thread and this daemon can both see the same row: the host dies
+/// mid-wave and the queue still says `queued`. Without a wait, both would run the
+/// same wave and every node would do its work twice.
+///
+/// A delay is chosen over a lock on purpose. A lock has a failure mode worse than
+/// the race it prevents — if it is left behind, the row never runs at all — while
+/// a delay only costs time, and the window it covers is the few seconds a wave
+/// takes to start writing its own progress.
+///
+/// Thirty seconds is generous for a wave to begin: the first thing a launch does is
+/// record the task's start, which rewrites the row.
+pub const ADOPT_AFTER_SECS: u64 = 30;
+
 /// How many times a failing row is retried before it is given up on.
 ///
 /// Without a cap a permanently broken row retries forever: the log grows, the
@@ -186,6 +201,16 @@ pub fn serve_log(path: &Path) -> usize {
     let mut ran = 0;
     for row in rows {
         if !is_due(&row, now) {
+            continue;
+        }
+        // Wait for the in-process thread to be clearly finished with this row:
+        // its due time is set when the row is queued, so a row still inside the
+        // adoption window may be one a live host is about to run.
+        //
+        // The wait is measured from when the row became due, not from when it was
+        // written, so a row that is legitimately scheduled for later is unaffected.
+        let settled_ms = row.due.elapsed().as_millis() as u64;
+        if settled_ms < ADOPT_AFTER_SECS.saturating_mul(1000) {
             continue;
         }
         ran += 1;
@@ -351,6 +376,12 @@ mod tests {
     use super::*;
     use crate::effects::{Binding, Effect};
 
+    /// A `due_at` far enough in the past that the daemon will adopt the row,
+    /// which is what a row abandoned by a dead host looks like.
+    fn adoptable() -> u64 {
+        crate::effects_log::now_ms().saturating_sub((ADOPT_AFTER_SECS + 1) * 1000)
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "rpi-superagent-daemon-{tag}-{}",
@@ -407,7 +438,7 @@ mod tests {
                 1,
                 None,
                 0,
-                crate::effects_log::now_ms(),
+                adoptable(),
                 None,
             )
             .unwrap();
@@ -472,7 +503,7 @@ mod tests {
                 1,
                 None,
                 0,
-                crate::effects_log::now_ms(),
+                adoptable(),
                 None,
             )
             .unwrap();
@@ -499,7 +530,7 @@ mod tests {
                 1,
                 None,
                 MAX_ATTEMPTS,
-                crate::effects_log::now_ms(),
+                adoptable(),
                 Some("always fails"),
             )
             .unwrap();
