@@ -233,6 +233,7 @@ pub(crate) fn failure_message(
     let selection = crate::host::Selection {
         provider: provider.map(str::to_string),
         model: model.map(str::to_string),
+        exe: None,
     };
     format!(
         "subagent exited with {} (selection={}):\n{}",
@@ -987,6 +988,7 @@ mod tests {
         let parent = crate::host::Selection {
             provider: Some("routeryo-copy".into()),
             model: Some("gpt-6.1-sol".into()),
+            exe: None,
         };
         let selection = parent.effective(None, None);
         let command = child_command(

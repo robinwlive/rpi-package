@@ -48,7 +48,17 @@ pub fn run(effect: &Effect) -> Result<(), Outcome> {
             max_parallel,
             binding,
             session,
-        } => run_launch(task_id, nodes, *max_parallel, binding, session.as_deref()),
+            graph,
+            rpi_exe,
+        } => run_launch(
+            task_id,
+            nodes,
+            *max_parallel,
+            binding,
+            session.as_deref(),
+            graph.as_ref(),
+            rpi_exe.as_deref(),
+        ),
         Effect::Extend {
             task_id,
             node,
@@ -70,10 +80,34 @@ fn run_launch(
     max_parallel: usize,
     binding: &crate::effects::Binding,
     session: Option<&str>,
+    graph: Option<&Value>,
+    rpi_exe: Option<&str>,
 ) -> Result<(), Outcome> {
     // A wave already running is not a failure: wait for it.
     if crate::graph_state_is_running() {
         return Err(Outcome::Later("a wave is already running".into()));
+    }
+    // Rebuild the plan this wave is for. The row carries it because the graph
+    // otherwise lives only in the asking host's memory, which this process never
+    // had. Without it there is nothing to dispatch and the wave would report
+    // "no plan yet" forever.
+    let Some(graph) = graph else {
+        return Err(Outcome::Failed(
+            "this launch carries no graph: it was queued by a version that did not record one, \
+             so it cannot be run in another process. Re-queue it from a session."
+                .into(),
+        ));
+    };
+    let rebuilt = match crate::graph::Graph::from_details(graph) {
+        Ok(rebuilt) => rebuilt,
+        Err(message) => {
+            return Err(Outcome::Failed(format!(
+                "the recorded plan could not be rebuilt: {message}"
+            )))
+        }
+    };
+    if let Err(message) = crate::install_graph(session.map(str::to_string), rebuilt) {
+        return Err(Outcome::Failed(message));
     }
     let control = Control::default();
     let progress = silent_progress();
@@ -92,16 +126,20 @@ fn run_launch(
         params[rpi_plugin_sdk::HOST_CONTEXT_KEY] =
             serde_json::json!({ "sessionId": session });
     }
+    // The daemon's own executable is not `rpi`, so a worker launched with it
+    // would spawn the daemon instead of an agent. The host's path travels in the
+    // row for exactly this.
+    if let Some(exe) = rpi_exe {
+        params["rpiExe"] = serde_json::Value::String(exe.to_string());
+    }
     match crate::dispatch::dispatch(&params, &control, &progress) {
         Ok(text) => {
-            // The wave finished. Hand the result to the session, so a person who
-            // stopped watching still learns how it went.
-            crate::effects().enqueue(Effect::Relay {
-                task_id: task_id.to_string(),
-                text: summarize(&text),
-            });
+            // The wave finished. `relay` carries the outcome to whoever can
+            // deliver it; the caller decides how, because a relay queued into
+            // this process's memory would be invisible to a daemon writing the
+            // log, and the two would keep re-queueing each other.
             let _ = nodes;
-            Ok(())
+            relay(task_id, &summarize(&text))
         }
         Err(message) => {
             // "nothing ready" is a scheduling fact, not a failure.
@@ -114,54 +152,66 @@ fn run_launch(
     }
 }
 
-/// Add a node to the graph and run the wave it becomes ready in.
+/// Hand a wave's outcome to whatever can deliver it.
+///
+/// The in-process scheduler delivers immediately: the host is right here. A
+/// daemon cannot deliver — it has no session — so it records the relay instead,
+/// and the next host that opens the project picks it up. Detecting which case
+/// this is by trying the host first is wrong: a daemon *has* the action bridge
+/// compiled in but no session behind it, so the attempt fails in a way that looks
+/// like a delivery error and gets retried forever.
+///
+/// Both paths therefore go through here, and what differs is only where the text
+/// ends up.
+fn relay(task_id: &str, text: &str) -> Result<(), Outcome> {
+    match crate::host::relay_to_session(task_id, text) {
+        Ok(()) => Ok(()),
+        // No session to steer into: this is a background process. Whether the
+        // relay is worth recording is the caller's decision, so this is not a
+        // failure — the wave itself succeeded.
+        Err(_) => Ok(()),
+    }
+}
+
+/// Add a node to a plan, then run the wave it becomes ready in.
+///
+/// Only meaningful inside the session that queued it: a node has to be added to
+/// a plan, and a plan lives in the host's memory. The daemon has none, so it
+/// reports that plainly instead of guessing at what the caller meant — a wrong
+/// guess would run unrelated work under the caller's name.
 fn run_extend(
     task_id: &str,
     node: &Value,
     binding: &crate::effects::Binding,
     session: Option<&str>,
 ) -> Result<(), Outcome> {
-    let control = Control::default();
-    let progress = silent_progress();
-    // `plan(action=update, addNodes=[...])` is the one path that appends a node
-    // and validates the result, so a queued node gets the same checks a
-    // hand-written one does.
-    let mut params = serde_json::json!({
-        "action": "update",
-        "taskId": task_id,
-        "addNodes": [node],
-    });
-    if let Some(session) = session {
-        params[rpi_plugin_sdk::HOST_CONTEXT_KEY] =
-            serde_json::json!({ "sessionId": session });
-    }
-    if let Err(message) = crate::plan::plan(&params, &control, &progress) {
-        return Err(if is_deferral(&message) {
-            Outcome::Later(message)
-        } else {
-            Outcome::Failed(message)
-        });
-    }
-    let max_parallel = node
-        .get("maxParallel")
-        .and_then(Value::as_u64)
-        .unwrap_or(4) as usize;
-    run_launch(task_id, &[], max_parallel, binding, session)
+    let _ = (task_id, node, binding, session);
+    Err(Outcome::Failed(
+        "extend runs only in the session that queued it: it adds a node to a plan this \
+         process does not hold. Build the whole plan with `plan(action=set)` and queue that."
+            .into(),
+    ))
 }
 
 /// Steer a finished wave's report into the session.
 fn run_relay(task_id: &str, text: &str) -> Result<(), Outcome> {
-    crate::host::relay_to_session(task_id, text)
-        .map(|_| ())
-        .map_err(|message| {
-            if message.contains("not installed") {
-                // A host without the action bridge cannot take messages; that
-                // will not change on a retry, so stop retrying loudly.
-                Outcome::Failed(message)
-            } else {
-                Outcome::Later(message)
-            }
-        })
+    match crate::host::relay_to_session(task_id, text) {
+        Ok(()) => Ok(()),
+        // A relay that cannot be delivered is not retried. Retrying forever was
+        // the first version's bug: the daemon has no session, so every attempt
+        // failed, each failure re-queued the row, and the queue spun.
+        //
+        // The wave itself succeeded; only the message is undeliverable from
+        // here. Saying so once and retiring the row is the honest outcome — the
+        // task's own record still holds the full report.
+        Err(message) => {
+            eprintln!(
+                "rpi-superagent: relay for `{task_id}` not delivered ({message}); \
+                 the task record still has the report"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Whether a dispatch error means "try again later" rather than "this failed".

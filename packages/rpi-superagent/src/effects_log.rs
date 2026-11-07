@@ -114,6 +114,12 @@ pub enum Stored {
         provider: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        /// The graph, so a process that never saw the plan can rebuild it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph: Option<serde_json::Value>,
+        /// The `rpi` executable to run workers with, captured from the host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rpi_exe: Option<String>,
     },
     Extend {
         task_id: String,
@@ -139,6 +145,8 @@ impl Stored {
                 max_parallel,
                 provider,
                 model,
+                graph,
+                rpi_exe,
             } => Effect::Launch {
                 task_id: task_id.clone(),
                 nodes: nodes.clone(),
@@ -148,6 +156,8 @@ impl Stored {
                     model: model.clone(),
                 },
                 session: None,
+                graph: graph.clone(),
+                rpi_exe: rpi_exe.clone(),
             },
             Stored::Extend {
                 task_id,
@@ -178,6 +188,8 @@ impl Stored {
                 nodes,
                 max_parallel,
                 binding,
+                graph,
+                rpi_exe,
                 ..
             } => Stored::Launch {
                 task_id: task_id.clone(),
@@ -185,6 +197,8 @@ impl Stored {
                 max_parallel: *max_parallel,
                 provider: binding.provider.clone(),
                 model: binding.model.clone(),
+                graph: graph.clone(),
+                rpi_exe: rpi_exe.clone(),
             },
             Effect::Extend {
                 task_id,
@@ -532,6 +546,8 @@ mod tests {
                 model: Some("claude-sonnet-5".into()),
             },
             session: Some("sess-1".into()),
+        graph: None,
+        rpi_exe: None,
         }
     }
 

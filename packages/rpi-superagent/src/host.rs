@@ -67,6 +67,13 @@ pub(crate) fn install(plugin: &rpi_plugin_sdk::PluginApi) {
 pub(crate) struct Selection {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// The `rpi` executable a worker should be launched with.
+    ///
+    /// Carried alongside the binding because it is the same kind of fact: the
+    /// host knows it, a background pass does not. Inside the daemon,
+    /// `current_exe` names the daemon, so a worker launched from it would spawn
+    /// a second scheduler instead of an agent.
+    pub exe: Option<String>,
 }
 
 impl Selection {
@@ -86,6 +93,9 @@ impl Selection {
             return Selection {
                 provider: explicit_provider.map(str::to_string),
                 model: explicit_model.map(str::to_string),
+                // The executable is not part of the binding choice; it travels
+                // with it so every worker of a wave uses the same one.
+                exe: self.exe.clone(),
             };
         }
         self.clone()
@@ -209,6 +219,9 @@ pub(crate) fn selection_from_context(context: &Value) -> Selection {
     Selection {
         provider: field("provider"),
         model: field("id"),
+        // The host reports the binding, not the executable: this process *is*
+        // an `rpi`, so `current_exe` is the right answer here.
+        exe: None,
     }
 }
 
@@ -404,7 +417,8 @@ mod tests {
         assert_eq!(
             Selection {
                 provider: Some("deepseek".into()),
-                model: None
+                model: None,
+                exe: None,
             }
             .label(),
             "deepseek"
@@ -417,6 +431,7 @@ mod tests {
         let parent = Selection {
             provider: Some("routeryo-copy".into()),
             model: Some("gpt-6.1-sol".into()),
+                exe: None,
         };
         // Nothing named: inherit the whole binding.
         assert_eq!(parent.effective(None, None), parent);
@@ -426,6 +441,7 @@ mod tests {
             Selection {
                 provider: Some("openai".into()),
                 model: Some("gpt-6-astra".into()),
+                exe: None,
             }
         );
         // Half named: only that half is passed, so the child resolves the rest.
@@ -433,14 +449,16 @@ mod tests {
             parent.effective(Some("deepseek"), None),
             Selection {
                 provider: Some("deepseek".into()),
-                model: None
+                model: None,
+                exe: None,
             }
         );
         assert_eq!(
             parent.effective(None, Some("deepseek-v4-pro")),
             Selection {
                 provider: None,
-                model: Some("deepseek-v4-pro".into())
+                model: Some("deepseek-v4-pro".into()),
+                exe: None,
             }
         );
     }

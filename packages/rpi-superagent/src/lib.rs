@@ -89,6 +89,22 @@ pub(crate) fn graph_task_id() -> Option<String> {
         .clone()
 }
 
+/// Install a reconstructed graph as the shared one.
+///
+/// Used by the background pass: the graph it is running lives in the effect log,
+/// not in this process's memory, so it has to be put back before `dispatch` can
+/// run it. The generation advances so a wave already in flight is treated as
+/// stale rather than applied to a graph it never saw.
+pub(crate) fn install_graph(session: Option<String>, graph: graph::Graph) -> Result<(), String> {
+    let mut guard = graph_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    guard.session = session;
+    guard.graph = graph;
+    guard.advance_generation();
+    Ok(())
+}
+
 /// The process-wide effect queue.
 ///
 /// One queue for the whole process rather than one per session: the effects are

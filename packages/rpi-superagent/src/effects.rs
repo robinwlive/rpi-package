@@ -108,6 +108,7 @@ pub enum Effect {
     /// provider, which is a different model and may not even be authenticated.
     Launch {
         task_id: String,
+        /// The ready nodes this wave covers, by id.
         nodes: Vec<String>,
         max_parallel: usize,
         binding: Binding,
@@ -118,6 +119,19 @@ pub enum Effect {
         /// **clear the very plan it was queued for**. Carrying the id is what
         /// keeps the background wave pointed at the same graph.
         session: Option<String>,
+        /// The whole graph, as [`crate::graph::Graph::to_details`] writes it.
+        ///
+        /// Carried because the graph otherwise lives only in the asking host's
+        /// memory. A scheduler in another process — the daemon, or the same host
+        /// after a restart — has no way to ask for it, so a wave it could read
+        /// but not rebuild was a wave it could not run at all.
+        graph: Option<serde_json::Value>,
+        /// The `rpi` executable to run node workers with.
+        ///
+        /// Also captured, for the same reason: `std::env::current_exe()` inside
+        /// the daemon names *the daemon*, which would make it spawn itself as a
+        /// worker. The host knows the right path; the daemon does not.
+        rpi_exe: Option<String>,
     },
     /// Add a node to a running task and run the wave it becomes ready in.
     ///
@@ -599,6 +613,8 @@ mod tests {
             max_parallel: 1,
             binding: Binding::default(),
             session: None,
+            graph: None,
+            rpi_exe: None,
         }
     }
 
@@ -627,6 +643,8 @@ mod tests {
             max_parallel: 2,
             binding: Binding::default(),
             session: None,
+            graph: None,
+            rpi_exe: None,
         });
         let rows = queue.rows();
         assert_eq!(rows.len(), 2);
@@ -700,6 +718,8 @@ mod tests {
                 max_parallel: 1,
                 binding: Binding::default(),
                 session: None,
+                graph: None,
+                rpi_exe: None,
             });
         }
         let mut seen = Vec::new();
@@ -742,6 +762,8 @@ mod tests {
                 model: Some("claude-sonnet-5".into()),
             },
             session: None,
+        graph: None,
+        rpi_exe: None,
         });
         let rows = queue.rows();
         match &rows[0].effect {
@@ -778,6 +800,8 @@ mod tests {
                     model: Some("claude-sonnet-5".into()),
                 },
                 session: Some("sess-9".into()),
+            graph: None,
+            rpi_exe: None,
             });
         }
 
@@ -837,6 +861,8 @@ mod tests {
             max_parallel: 1,
             binding: Binding::default(),
             session: Some("sess-42".into()),
+            graph: None,
+            rpi_exe: None,
         });
         match &queue.rows()[0].effect {
             Effect::Launch { session, .. } => {

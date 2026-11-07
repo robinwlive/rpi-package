@@ -32,6 +32,22 @@ impl Status {
             Status::Skipped => "skipped",
         }
     }
+
+    /// Read a status back from its name.
+    ///
+    /// Unknown names read as `pending`: a status this version does not know is
+    /// work it cannot claim was done, and re-running is recoverable while
+    /// skipping silently is not.
+    pub fn parse(value: &str) -> Status {
+        match value {
+            "done" => Status::Done,
+            "failed" => Status::Failed,
+            "skipped" => Status::Skipped,
+            // `running` becomes `pending`: a wave that was running when its host
+            // died did not finish, so it has to be retried, not resumed.
+            _ => Status::Pending,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +219,57 @@ impl Graph {
             "nodes": self.nodes.iter().map(Node::to_value).collect::<Vec<_>>(),
             "taskId": self.task_id,
         })
+    }
+
+    /// Rebuild a graph from [`Graph::to_details`].
+    ///
+    /// This is what lets a process that never saw the plan run it: the effect
+    /// log stores the details, and a scheduler in another process — or the same
+    /// one after a restart — reconstructs the graph from them.
+    ///
+    /// Node status is preserved, with two deliberate exceptions:
+    ///
+    /// - `running` becomes `pending`. A node that was running when its host
+    ///   disappeared did not finish, and its worker's output is gone with it, so
+    ///   it has to run again — resuming it would claim work that never completed.
+    /// - An unknown status becomes `pending` for the same reason: re-running is
+    ///   recoverable, silently skipping is not.
+    ///
+    /// A node's `result` is kept, so a wave that is half done keeps the output of
+    /// the half that is finished.
+    pub fn from_details(value: &Value) -> Result<Graph, String> {
+        let nodes = value
+            .get("nodes")
+            .ok_or("details need a `nodes` array")?;
+        let array = nodes.as_array().ok_or("`nodes` must be an array")?;
+        if array.is_empty() {
+            return Err("`nodes` must contain at least one node".into());
+        }
+        let mut built = Vec::with_capacity(array.len());
+        for item in array {
+            let mut node = Node::from_value(item)?;
+            if let Some(name) = item.get("status").and_then(Value::as_str) {
+                node.status = Status::parse(name);
+            }
+            node.result = item
+                .get("result")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            node.error = item
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            built.push(node);
+        }
+        let graph = Graph {
+            nodes: built,
+            task_id: value
+                .get("taskId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        graph.validate()?;
+        Ok(graph)
     }
 
     pub fn get(&self, id: &str) -> Option<&Node> {
@@ -479,6 +546,70 @@ mod tests {
     /// A node that names a session keeps the name, and it survives the round
     /// trip to `to_details`, so a later node with the same name resumes that
     /// worker instead of starting from nothing.
+    /// A graph written to details and read back is the same graph, so a
+    /// scheduler in another process can run the plan it never saw.
+    #[test]
+    fn details_round_trip() {
+        let g = graph(json!([
+            {"id": "a", "task": "first", "session": "w1"},
+            {"id": "b", "task": "second", "deps": ["a"], "expectFile": "out.txt", "isolation": true}
+        ]));
+        let details = g.to_details();
+        let back = Graph::from_details(&details).unwrap();
+        assert_eq!(back.nodes.len(), 2);
+        assert_eq!(back.get("a").unwrap().task, "first");
+        assert_eq!(back.get("a").unwrap().session.as_deref(), Some("w1"));
+        let b = back.get("b").unwrap();
+        assert_eq!(b.deps, vec!["a".to_string()]);
+        assert_eq!(b.expect_file.as_deref(), Some("out.txt"));
+        assert!(b.isolation);
+    }
+
+    #[test]
+    fn details_keep_a_finished_node_finished() {
+        // Re-running work that already finished would repeat its side effects.
+        let mut g = graph(json!([
+            {"id": "a", "task": "first"},
+            {"id": "b", "task": "second", "deps": ["a"]}
+        ]));
+        g.get_mut("a").unwrap().status = Status::Done;
+        g.get_mut("a").unwrap().result = Some("output".into());
+        let back = Graph::from_details(&g.to_details()).unwrap();
+        assert_eq!(back.get("a").unwrap().status, Status::Done);
+        assert_eq!(back.get("a").unwrap().result.as_deref(), Some("output"));
+        assert_eq!(back.get("b").unwrap().status, Status::Pending);
+    }
+
+    #[test]
+    fn a_running_node_comes_back_pending() {
+        // A wave that was running when its host died did not finish; its worker's
+        // output is gone, so the node has to run again.
+        let mut g = graph(json!([{"id": "a", "task": "x"}]));
+        g.get_mut("a").unwrap().status = Status::Running;
+        let back = Graph::from_details(&g.to_details()).unwrap();
+        assert_eq!(back.get("a").unwrap().status, Status::Pending);
+    }
+
+    #[test]
+    fn an_unknown_status_comes_back_pending() {
+        // Skipping silently would be worse than re-running.
+        let details = json!({
+            "nodes": [{"id": "a", "task": "x", "status": "something-new"}],
+            "taskId": null
+        });
+        let g = Graph::from_details(&details).unwrap();
+        assert_eq!(g.get("a").unwrap().status, Status::Pending);
+    }
+
+    #[test]
+    fn details_carry_the_task_id() {
+        let details = json!({
+            "nodes": [{"id": "a", "task": "x"}],
+            "taskId": "T9"
+        });
+        assert_eq!(Graph::from_details(&details).unwrap().task_id.as_deref(), Some("T9"));
+    }
+
     #[test]
     fn a_node_keeps_its_session_name() {
         let g = graph(json!([

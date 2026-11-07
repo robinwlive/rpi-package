@@ -70,7 +70,10 @@ fn queue_wave(params: &Value, max_parallel: usize) -> Result<String, String> {
              has a subject to report against",
         )?;
 
-    let ready = {
+    // Everything the pass cannot ask for later is captured here, while the host
+    // still answers: the graph itself (it lives in this process's memory), and
+    // the executable to run workers with.
+    let (ready, details) = {
         let guard = lock_graph(params);
         let graph = guard.graph();
         if graph.nodes.is_empty() {
@@ -89,7 +92,7 @@ fn queue_wave(params: &Value, max_parallel: usize) -> Result<String, String> {
                 graph.to_details(),
             ));
         }
-        ready
+        (ready, graph.to_details())
     };
 
     crate::effects().enqueue(crate::effects::Effect::Launch {
@@ -102,6 +105,13 @@ fn queue_wave(params: &Value, max_parallel: usize) -> Result<String, String> {
         // Same reason: the graph is keyed by session, so the pass must run as
         // this session or it would clear the plan it is meant to execute.
         session: crate::session_of(params),
+        // And the plan itself, so a process that never saw it can rebuild it.
+        graph: Some(details),
+        // `current_exe` inside the daemon names the daemon, so the host's own
+        // path is the only correct answer for a worker.
+        rpi_exe: std::env::current_exe()
+            .ok()
+            .map(|exe| exe.to_string_lossy().into_owned()),
     });
     // Do not wait for the scheduler's tick: the caller just asked for this.
     if let Some(passes) = crate::PASSES.get() {
@@ -220,6 +230,10 @@ pub(super) fn dispatch_with(
                 .map(str::to_string),
             model: binding
                 .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            exe: params
+                .get("rpiExe")
                 .and_then(Value::as_str)
                 .map(str::to_string),
         },
@@ -518,12 +532,23 @@ pub(super) fn run_wave(
                     } else {
                         None
                     };
+                    // The worker must be an `rpi`, not whatever process is asking:
+                    // inside the daemon `current_exe` names the daemon, and a
+                    // worker launched with it would spawn a second daemon.
+                    let worker_exe = parent.exe.as_deref().map(std::path::PathBuf::from);
+                    let parent_ref = parent.clone();
                     let handle = scope.spawn(move || {
-                        let exe = match std::env::current_exe() {
-                            Ok(exe) => exe,
-                            Err(error) => {
-                                return Err(format!("cannot resolve the rpi executable: {error}"))
-                            }
+                        let _ = &parent_ref;
+                        let exe = match worker_exe {
+                            Some(exe) => exe,
+                            None => match std::env::current_exe() {
+                                Ok(exe) => exe,
+                                Err(error) => {
+                                    return Err(format!(
+                                        "cannot resolve the rpi executable: {error}"
+                                    ))
+                                }
+                            },
                         };
                         let mut on_started = |pid: u32| {
                             if let Ok(mut pids) = pids.lock() {

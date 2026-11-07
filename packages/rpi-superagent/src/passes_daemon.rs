@@ -332,6 +332,8 @@ mod tests {
                     max_parallel: 1,
                     binding: Binding::default(),
                     session: None,
+                    graph: None,
+                    rpi_exe: None,
                 },
                 1,
                 None,
