@@ -571,11 +571,11 @@ pub fn run_child_reporting(
     // after `stdin` exists. The reader thread starts first so no early question is
     // missed; questions that arrive before the hook is wired are still collected in
     // the outcome (they just cannot be auto-answered).
-    let (question_tx, question_rx) = mpsc::channel::<Question>();
+    let (signal_tx, signal_rx) = mpsc::channel::<WorkerSignal>();
     let out_reader = child.stdout.take().map(|stdout| {
-        spawn_event_reader_with(stdout, move |question| {
+        spawn_event_reader_signalled(stdout, move |signal| {
             // Best-effort: if the main loop is gone, the worker is gone too.
-            let _ = question_tx.send(question);
+            let _ = signal_tx.send(signal);
         })
     });
     let err_reader = child.stderr.take().map(spawn_reader);
@@ -599,10 +599,10 @@ pub fn run_child_reporting(
             kill_and_reap(&mut child, &tree);
             return Err(format!("subagent timed out after {timeout_secs}s"));
         }
-        // Answer whatever the worker asked while we wait. This is the whole point
-        // of keeping stdin open: a question that is not answered here becomes a
-        // worker that dies at the deadline with its work unfinished.
-        while let Ok(question) = question_rx.try_recv() {
+        // Handle whatever the worker signalled while we wait.
+        while let Ok(signal) = signal_rx.try_recv() {
+          match signal {
+            WorkerSignal::Asked(question) => {
             match auto_answer(&question.ui) {
                 Some(answer) => {
                     write_line(&mut stdin, &dialog_response_frame(&question.request_id, &answer));
@@ -622,6 +622,23 @@ pub fn run_child_reporting(
                     );
                 }
             }
+            }
+            WorkerSignal::Finished => {
+                // **The worker is done talking; close its stdin so it exits.**
+                //
+                // `--mode rpc` is a long-lived host: it finishes a turn and then
+                // sits waiting for the *next* prompt forever. `-p` exited on its
+                // own, so this never came up before — the switch to rpc turned
+                // every worker into a process that outlives its work. Left alone,
+                // dispatch waits for the wall-clock deadline (300 s default) on
+                // nodes that finished in seconds, and those processes pile up.
+                //
+                // Dropping the handle closes the pipe; the host reads EOF and
+                // shuts down. That is the one signal an rpc host treats as "no
+                // more work".
+                stdin = None;
+            }
+          }
         }
         let slice = deadline
             .saturating_duration_since(Instant::now())
@@ -808,6 +825,18 @@ pub(crate) fn prompt_frame(task: &str) -> String {
     .to_string()
 }
 
+/// A signal from the worker that the waiting loop must act on **now**.
+///
+/// Both variants are things the loop cannot wait for the stream to end to learn:
+/// a question blocks the worker, and completion is what tells us to close stdin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkerSignal {
+    /// It asked something and is blocked on the answer.
+    Asked(Question),
+    /// Its turn ended. `--mode rpc` will not exit on its own; see the handler.
+    Finished,
+}
+
 /// One question a worker asked mid-run, as it arrives.
 ///
 /// Carried separately from [`RpcOutcome`] because it must be delivered **while the
@@ -839,6 +868,9 @@ pub struct RpcOutcome {
 /// Kept pure and separate from the wait loop: the shape of these frames is the
 /// contract with `rpi`, and a unit test is the only thing that will notice when
 /// upstream renames a field.
+/// [`fold_rpc_event_with`] with no signal hook. Kept for tests, which assert on
+/// the outcome without caring about delivery timing.
+#[cfg(test)]
 pub fn fold_rpc_event(line: &str, out: &mut RpcOutcome) -> bool {
     fold_rpc_event_with(line, out, &mut |_| {})
 }
@@ -1157,20 +1189,19 @@ pub(crate) fn spawn_reader<R: Read + Send + 'static>(
 /// Lines that fail to parse are kept as `noise` rather than dropped: a non-frame
 /// line usually means the host printed a diagnostic, and that is exactly what
 /// explains a worker that "ran but said nothing".
-/// Same as [`spawn_event_reader`], plus a hook for each dialog request as it
-/// arrives.
+/// Read an `rpc` worker's stdout and emit [`WorkerSignal`]s as they arrive.
 ///
-/// The hook runs **on the reader thread, before the worker can be answered** —
-/// that is what lets the caller write the answer back while the worker is still
-/// blocked on it. Doing this after the stream ends would be too late: the worker
-/// is waiting *now*.
-pub(crate) fn spawn_event_reader_with<R, F>(
+/// Differences from [`spawn_event_reader`]: questions are delivered **when parsed**
+/// (the worker is blocked on them) and the end of the turn is delivered as
+/// [`WorkerSignal::Finished`] so the caller can close stdin — an `rpc` host does
+/// not exit by itself.
+pub(crate) fn spawn_event_reader_signalled<R, F>(
     mut reader: R,
-    mut on_question: F,
+    mut on_signal: F,
 ) -> (Receiver<RpcOutcome>, JoinHandle<()>)
 where
     R: Read + Send + 'static,
-    F: FnMut(Question) + Send + 'static,
+    F: FnMut(WorkerSignal) + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel();
     let handle = std::thread::spawn(move || {
@@ -1179,15 +1210,13 @@ where
         let mut buf = [0u8; 8192];
         let mut raw_bytes = 0usize;
         let mut raw_tail = String::new();
+        let mut told_finished = false;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(count) => {
-                    // Bound what we are willing to buffer: a worker that streams
-                    // megabytes must not grow this thread without limit.
                     raw_bytes = raw_bytes.saturating_add(count);
                     pending.push_str(&String::from_utf8_lossy(&buf[..count]));
-                    // Keep a bounded copy of the raw stream for the failure text.
                     if raw_tail.len() < 4_000 {
                         raw_tail.push_str(&String::from_utf8_lossy(&buf[..count]));
                         if raw_tail.len() > 4_000 {
@@ -1201,7 +1230,15 @@ where
                     }
                     while let Some(pos) = pending.find('\n') {
                         let line: String = pending.drain(..=pos).collect();
-                        fold_rpc_event_with(&line, &mut outcome, &mut on_question);
+                        let was_finished = outcome.finished;
+                        fold_rpc_event_with(&line, &mut outcome, &mut |question| {
+                            on_signal(WorkerSignal::Asked(question));
+                        });
+                        // Fire once, when the turn first ends.
+                        if !was_finished && outcome.finished && !told_finished {
+                            told_finished = true;
+                            on_signal(WorkerSignal::Finished);
+                        }
                     }
                     if raw_bytes > MAX_OUTPUT_BYTES * 8 {
                         break;
@@ -1210,13 +1247,16 @@ where
                 Err(_) => break,
             }
         }
-        // A last line without a trailing newline still counts.
         if !pending.trim().is_empty() {
-            fold_rpc_event(&pending, &mut outcome);
+            let was_finished = outcome.finished;
+            fold_rpc_event_with(&pending, &mut outcome, &mut |question| {
+                on_signal(WorkerSignal::Asked(question));
+            });
+            if !was_finished && outcome.finished && !told_finished {
+                on_signal(WorkerSignal::Finished);
+            }
         }
         if !outcome.finished && outcome.reply.is_empty() {
-            // Nothing parsed as an answer: hand back what the host actually said,
-            // so "worker produced nothing" has a cause attached.
             outcome.reply = format!(
                 "[no turn_end / agent_end in the worker's output]\n{}",
                 raw_tail.trim_end()
