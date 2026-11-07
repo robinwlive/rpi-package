@@ -221,7 +221,7 @@ pub fn serve_log(path: &Path) -> usize {
                 // the next tick would do it again.
                 if let Err(error) = log.append_state(
                     row.effect.kind(),
-                    row.effect.key(),
+                    &row.effect.row_key(),
                     row.seq,
                     crate::effects_log::State::Done,
                     None,
@@ -259,7 +259,7 @@ pub fn serve_log(path: &Path) -> usize {
                     );
                     let _ = log.append_state(
                         row.effect.kind(),
-                        row.effect.key(),
+                        &row.effect.row_key(),
                         row.seq,
                         crate::effects_log::State::Done,
                         Some(&message),
@@ -330,13 +330,23 @@ pub fn start_daemon(cwd: &Path) -> bool {
     let Some(exe) = daemon_executable() else {
         return false;
     };
+    // Diagnostics go to a file rather than nowhere. A background process whose
+    // stderr is discarded cannot explain itself, and "the queue did nothing" is
+    // exactly the kind of failure that needs an explanation.
+    let log = cwd.join(ROOT).join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
     std::process::Command::new(&exe)
         .current_dir(cwd)
         // No terminal: a caller reading this process's pipes must not be held
         // open by the daemon.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(stderr)
         .spawn()
         .is_ok()
 }
@@ -434,6 +444,7 @@ mod tests {
                     session: None,
                     graph: None,
                     rpi_exe: None,
+                    wave: 0,
                 },
                 1,
                 None,
@@ -565,7 +576,7 @@ mod tests {
             4,
             &Binding::default(),
             None,
-            None,
+            None, 0
         )
         .expect("b is ready now that a is done");
         match next {
@@ -586,7 +597,7 @@ mod tests {
             "tier": 0,
             "nodes": [{"id": "a", "task": "only", "status": "done"}]
         });
-        assert!(crate::next_ready_wave(&graph, 4, &Binding::default(), None, None).is_none());
+        assert!(crate::next_ready_wave(&graph, 4, &Binding::default(), None, None, 0).is_none());
     }
 
     #[test]

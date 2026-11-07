@@ -269,8 +269,11 @@ pub fn child_command_with_session(
                 // host refuses `--session` for an unknown name, so this is a
                 // lookup, not a fallback.
                 match find_session_id(dir, session) {
-                    Some(id) => command.arg("--session").arg(id),
-                    None => command.arg("--name").arg(session),
+                    Some(id) if !id.trim().is_empty() => command.arg("--session").arg(id),
+                    // An empty id is not a session to resume: passing an empty
+                    // --session makes the host fail the lookup and the worker
+                    // never starts, so fall through to creating one.
+                    _ => command.arg("--name").arg(session),
                 };
             } else {
                 // No directory to search: the name cannot be resolved, so it is

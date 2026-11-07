@@ -47,6 +47,15 @@ use std::time::{Duration, Instant};
 /// Consecutive failures before a kind is reported as broken.
 pub const FAILURES_BEFORE_ERROR: u32 = 3;
 
+/// How long a continuation waits before it may start.
+///
+/// A wave's workers exit as its last act, and each holds its session file until
+/// then. A continuation queued in the same breath therefore fails with "already
+/// open in another rpi process" — a scheduling race that looks like a session bug.
+/// Two seconds is longer than a process needs to exit and shorter than anyone
+/// watching would notice.
+pub const SESSION_RELEASE_GRACE: Duration = Duration::from_secs(2);
+
 /// Signals that an effect cannot run **now** — all worker slots are taken, or
 /// processing is paused. The row is rescheduled at the kind's initial retry
 /// delay and its attempt count is left alone: waiting is not failing.
@@ -139,6 +148,14 @@ pub enum Effect {
         /// the daemon names *the daemon*, which would make it spawn itself as a
         /// worker. The host knows the right path; the daemon does not.
         rpi_exe: Option<String>,
+        /// Which wave of the task this is, counting from zero.
+        ///
+        /// Part of the queue key, not decoration. A wave that queues its own
+        /// continuation would otherwise enqueue under the same key as the row it
+        /// is running inside — `enqueue` would replace that row, and the queue's
+        /// "this row finished" write would then remove it. The plan would stop
+        /// after one wave, with nothing logged to say why.
+        wave: u64,
     },
     /// Add a node to a running task and run the wave it becomes ready in.
     ///
@@ -161,11 +178,25 @@ pub enum Effect {
 
 impl Effect {
     /// The key this effect coalesces on.
+    ///
+    /// A launch is keyed per wave so its continuation does not collide with the
+    /// row currently running; a relay and an extend are keyed per task.
     pub fn key(&self) -> &str {
         match self {
-            Effect::Launch { task_id, .. }
-            | Effect::Extend { task_id, .. }
-            | Effect::Relay { task_id, .. } => task_id,
+            Effect::Launch { task_id, .. } => task_id,
+            Effect::Extend { task_id, .. } | Effect::Relay { task_id, .. } => task_id,
+        }
+    }
+
+    /// The key as the queue stores it: kind plus subject, with the wave number for
+    /// a launch.
+    ///
+    /// `key()` stays the human-facing subject (a task id, which is what a caller
+    /// names); this is what decides coalescing.
+    pub fn row_key(&self) -> String {
+        match self {
+            Effect::Launch { task_id, wave, .. } => format!("{task_id}#{wave}"),
+            other => other.key().to_string(),
         }
     }
 
@@ -320,7 +351,9 @@ impl Effects {
         let due_at = {
             let rows = self.rows.lock().unwrap_or_else(|error| error.into_inner());
             rows.iter()
-                .find(|row| row.effect.kind() == effect.kind() && row.effect.key() == effect.key())
+                .find(|row| {
+                    row.effect.kind() == effect.kind() && row.effect.row_key() == effect.row_key()
+                })
                 .map(|row| {
                     let wait = row.due.saturating_duration_since(Instant::now());
                     crate::effects_log::now_ms() + wait.as_millis() as u64
@@ -358,15 +391,24 @@ impl Effects {
     /// replaces its payload and makes it due immediately without changing queue
     /// order."*
     pub fn enqueue(&self, effect: Effect) {
-        let now = Instant::now();
+        self.enqueue_due(effect, Instant::now());
+    }
+
+    /// Queue an effect, not runnable before `due`.
+    ///
+    /// Used for a wave that continues another: its workers still hold their
+    /// sessions while the previous wave's children exit, so starting now would
+    /// collide on the session file.
+    pub fn enqueue_due(&self, effect: Effect, due: Instant) {
+        let now = due;
         let kind = effect.kind();
-        let key = effect.key().to_string();
+        let key = effect.row_key();
         let seq;
         {
             let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(index) = rows
                 .iter()
-                .position(|row| row.effect.kind() == kind && row.effect.key() == key)
+                .position(|row| row.effect.kind() == kind && row.effect.row_key() == key)
             {
                 // Replacing a waiting row keeps its queue position.
                 seq = rows[index].seq;
@@ -393,7 +435,11 @@ impl Effects {
         rows
     }
 
-    /// Whether a row for this kind and key is waiting.
+    /// Whether a row with this task id is waiting.
+    ///
+    /// Matched on the task, not the row key: a launch's row key carries its wave
+    /// number, and a caller asking "is task T1 still queued" should not have to
+    /// know which wave it is on.
     pub fn pending(&self, kind: Kind, key: &str) -> bool {
         self.rows
             .lock()
@@ -402,7 +448,8 @@ impl Effects {
             .any(|row| row.effect.kind() == kind && row.effect.key() == key)
     }
 
-    /// Drop a waiting row. A row already running finishes normally.
+    /// Drop every waiting row a task has of this kind. A row already running
+    /// finishes normally.
     pub fn cancel(&self, kind: Kind, key: &str) {
         let seq = {
             let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
@@ -465,9 +512,10 @@ impl Effects {
                     // An ordered kind never runs twice at once.
                     continue;
                 }
-                if running.iter().any(|(k, key)| {
-                    *k == kind && key == row.effect.key()
-                }) {
+                if running
+                    .iter()
+                    .any(|(k, key)| *k == kind && *key == row.effect.row_key())
+                {
                     continue;
                 }
                 *count += 1;
@@ -479,7 +527,7 @@ impl Effects {
         let mut ran = 0;
         for row in ready {
             let kind = row.effect.kind();
-            let key = row.effect.key().to_string();
+            let key = row.effect.row_key();
             self.running
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -506,8 +554,10 @@ impl Effects {
         let now = Instant::now();
         {
             let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+            // `key` is the row key (a launch's carries its wave), which is what
+            // `dispatch` passed in.
             let Some(index) = rows.iter().position(|row| {
-                row.effect.kind() == kind && row.effect.key() == key && row.seq == seq
+                row.effect.kind() == kind && row.effect.row_key() == key && row.seq == seq
             }) else {
                 // The row was cancelled while it ran, or replaced. Its result is
                 // for a payload that is no longer queued, so drop it.
@@ -622,6 +672,7 @@ mod tests {
             session: None,
             graph: None,
             rpi_exe: None,
+            wave: 0,
         }
     }
 
@@ -652,6 +703,7 @@ mod tests {
             session: None,
             graph: None,
             rpi_exe: None,
+            wave: 0,
         });
         let rows = queue.rows();
         assert_eq!(rows.len(), 2);
@@ -727,6 +779,7 @@ mod tests {
                 session: None,
                 graph: None,
                 rpi_exe: None,
+                wave: 0,
             });
         }
         let mut seen = Vec::new();
@@ -772,6 +825,7 @@ mod tests {
             session: None,
         graph: None,
         rpi_exe: None,
+        wave: 0,
         });
         let rows = queue.rows();
         match &rows[0].effect {
@@ -811,6 +865,7 @@ mod tests {
                 session: Some("sess-9".into()),
             graph: None,
             rpi_exe: None,
+            wave: 0,
             });
         }
 
@@ -872,6 +927,7 @@ mod tests {
             session: Some("sess-42".into()),
             graph: None,
             rpi_exe: None,
+            wave: 0,
         });
         match &queue.rows()[0].effect {
             Effect::Launch { session, .. } => {

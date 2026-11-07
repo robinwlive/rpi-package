@@ -90,20 +90,6 @@ pub(crate) fn graph_task_id() -> Option<String> {
         .clone()
 }
 
-/// The shared graph's current details.
-///
-/// Used after a wave to queue the next one from the state the wave left behind,
-/// rather than the state it started from.
-pub(crate) fn graph_details() -> Option<serde_json::Value> {
-    let guard = graph_state()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    if guard.graph.nodes.is_empty() {
-        return None;
-    }
-    Some(guard.graph.to_details())
-}
-
 /// The next wave of `graph`, if any node is ready for it.
 ///
 /// A plan that takes more than one wave needs each wave to queue the next: the
@@ -115,6 +101,7 @@ pub(crate) fn next_ready_wave(
     binding: &effects::Binding,
     session: Option<&str>,
     rpi_exe: Option<&str>,
+    wave: u64,
 ) -> Option<effects::Effect> {
     let rebuilt = graph::Graph::from_details(graph).ok()?;
     let ready = rebuilt.ready();
@@ -133,6 +120,7 @@ pub(crate) fn next_ready_wave(
         session: session.map(str::to_string),
         graph: Some(graph.clone()),
         rpi_exe: rpi_exe.map(str::to_string),
+        wave,
     })
 }
 
@@ -368,10 +356,17 @@ rpi_plugin_sdk::export_plugin!(|api| {
     // daemon covers the case where the host dies. The daemon's lock keeps two
     // daemons apart; the thread and the daemon are kept apart by the graph's
     // running-wave check.
-    let _ = PASSES.set(Mutex::new(passes::Passes::start(
-        effects().clone(),
-        effects_handler::run,
-    )));
+    // Only a host that stays up runs the in-process scheduler. A one-shot run
+    // would start a wave, exit mid-flight, and leave the daemon to start the same
+    // wave again — the two collide on the worker's session file. A long-lived host
+    // and the daemon do not collide: the daemon waits for a row to look abandoned
+    // before it adopts it.
+    if !crate::host::host_exits_after_this_turn() {
+        let _ = PASSES.set(Mutex::new(passes::Passes::start(
+            effects().clone(),
+            effects_handler::run,
+        )));
+    }
     if let Ok(cwd) = std::env::current_dir() {
         let _ = passes_daemon::create_root(&passes_daemon::effects_dir(&cwd));
         passes_daemon::start_daemon(&cwd);

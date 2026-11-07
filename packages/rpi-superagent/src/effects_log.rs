@@ -124,6 +124,9 @@ pub enum Stored {
         /// The `rpi` executable to run workers with, captured from the host.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rpi_exe: Option<String>,
+        /// Which wave of the task this is; part of the queue key.
+        #[serde(default)]
+        wave: u64,
     },
     Extend {
         task_id: String,
@@ -154,6 +157,7 @@ impl Stored {
                 thinking,
                 graph,
                 rpi_exe,
+                wave,
             } => Effect::Launch {
                 task_id: task_id.clone(),
                 nodes: nodes.clone(),
@@ -166,6 +170,7 @@ impl Stored {
                 session: None,
                 graph: graph.clone(),
                 rpi_exe: rpi_exe.clone(),
+                wave: *wave,
             },
             Stored::Extend {
                 task_id,
@@ -200,6 +205,7 @@ impl Stored {
                 binding,
                 graph,
                 rpi_exe,
+                wave,
                 ..
             } => Stored::Launch {
                 task_id: task_id.clone(),
@@ -210,6 +216,7 @@ impl Stored {
                 thinking: binding.thinking.clone(),
                 graph: graph.clone(),
                 rpi_exe: rpi_exe.clone(),
+                wave: *wave,
             },
             Effect::Extend {
                 task_id,
@@ -433,7 +440,10 @@ impl Log {
         let line = Line {
             v: VERSION,
             kind: kind_name(effect.kind()).to_string(),
-            key: effect.key().to_string(),
+            // The row key, not the task id: a launch's carries its wave, and the
+            // `done` line written later is keyed the same way. Mismatched keys are
+            // why a finished row used to come back after a restart.
+            key: effect.row_key(),
             state: State::Queued,
             seq,
             attempts,
@@ -571,6 +581,7 @@ mod tests {
             session: Some("sess-1".into()),
         graph: None,
         rpi_exe: None,
+        wave: 0,
         }
     }
 
@@ -621,7 +632,7 @@ mod tests {
         let mut log = Log::open(&dir, "s1").unwrap();
         log.append_queued(&launch("T1"), 1, None, 0, now_ms(), None)
             .unwrap();
-        log.append_state(Kind::Launch, "T1", 1, State::Done, None)
+        log.append_state(Kind::Launch, "T1#0", 1, State::Done, None)
             .unwrap();
         assert!(log.load().is_empty());
     }
@@ -632,7 +643,7 @@ mod tests {
         let mut log = Log::open(&dir, "s1").unwrap();
         log.append_queued(&launch("T1"), 1, None, 0, now_ms(), None)
             .unwrap();
-        log.append_state(Kind::Launch, "T1", 1, State::Cancelled, None)
+        log.append_state(Kind::Launch, "T1#0", 1, State::Cancelled, None)
             .unwrap();
         assert!(log.load().is_empty());
     }
@@ -644,7 +655,7 @@ mod tests {
         let mut log = Log::open(&dir, "s1").unwrap();
         log.append_queued(&launch("T1"), 1, None, 0, now_ms(), None)
             .unwrap();
-        log.append_state(Kind::Launch, "T1", 1, State::Done, None)
+        log.append_state(Kind::Launch, "T1#0", 1, State::Done, None)
             .unwrap();
         log.append_queued(&launch("T1"), 2, None, 0, now_ms(), None)
             .unwrap();

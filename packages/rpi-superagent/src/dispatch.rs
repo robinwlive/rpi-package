@@ -112,6 +112,8 @@ fn queue_wave(params: &Value, max_parallel: usize) -> Result<String, String> {
         rpi_exe: std::env::current_exe()
             .ok()
             .map(|exe| exe.to_string_lossy().into_owned()),
+        // The first wave of this task. Each continuation bumps it.
+        wave: 0,
     });
     // Do not wait for the scheduler's tick: the caller just asked for this.
     if let Some(passes) = crate::PASSES.get() {
@@ -216,10 +218,12 @@ pub(super) fn dispatch_with(
         .task_id
         .clone()
         .and_then(|task_id| start_heartbeat(task_id, Arc::clone(&pids)));
+    // Best effort, and quiet. The task record is a convenience: when there is no
+    // long task, or the host's action bridge is not up yet (a worker starting
+    // cold), the wave still has to run. Reporting it loudly enough to be mistaken
+    // for a failure is how a working wave got marked failed.
     if let Some(task_id) = graph.task_id.clone() {
-        if let Err(error) = record_progress(&task_id, graph, &[]) {
-            eprintln!("could not record the start of task `{task_id}`: {error}");
-        }
+        let _ = record_progress(&task_id, graph, &[]);
     }
 
     // Snapshot before releasing the lock into the wave: the children run for a

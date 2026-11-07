@@ -136,6 +136,7 @@ mod tests {
             session: None,
             graph: None,
             rpi_exe: None,
+            wave: 0,
         }
     }
 

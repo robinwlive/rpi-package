@@ -50,6 +50,7 @@ pub fn run(effect: &Effect) -> Result<(), Outcome> {
             session,
             graph,
             rpi_exe,
+            wave,
         } => run_launch(
             task_id,
             nodes,
@@ -58,6 +59,7 @@ pub fn run(effect: &Effect) -> Result<(), Outcome> {
             session.as_deref(),
             graph.as_ref(),
             rpi_exe.as_deref(),
+            *wave,
         ),
         Effect::Extend {
             task_id,
@@ -74,6 +76,7 @@ pub fn run(effect: &Effect) -> Result<(), Outcome> {
 /// `binding` is the provider/model the asking session ran on. The background
 /// pass has no invocation handle, so this is the only way the children inherit
 /// it: without it they would resolve the default provider instead.
+#[allow(clippy::too_many_arguments)]
 fn run_launch(
     task_id: &str,
     nodes: &[String],
@@ -82,6 +85,7 @@ fn run_launch(
     session: Option<&str>,
     graph: Option<&Value>,
     rpi_exe: Option<&str>,
+    wave: u64,
 ) -> Result<(), Outcome> {
     // A wave already running is not a failure: wait for it.
     if crate::graph_state_is_running() {
@@ -169,14 +173,28 @@ fn run_launch(
             // ready, and the rest are now unblocked. Queueing the next wave here is
             // what keeps a whole plan moving; without it the row retires after the
             // first wave and the remaining nodes never run.
-            // The graph *as it now stands*, not as it was queued: this wave marked
-            // its nodes done, and passing the original would queue a next wave that
-            // redoes them.
-            let current = crate::graph_details();
-            if let Some(next) = current.and_then(|current| {
-                crate::next_ready_wave(&current, max_parallel, binding, session, rpi_exe)
-            }) {
-                crate::effects().enqueue(next);
+            // The graph *as this wave left it*, taken from the wave's own answer.
+            //
+            // Not from the shared graph state: when the in-process thread runs the
+            // wave, dispatch has already released that state, and when the daemon
+            // runs it the state belongs to a process that never saw the plan. The
+            // reply is the one description of the graph that both paths have.
+            if let Ok(cwd) = std::env::current_dir() {
+                let _ = std::fs::write(cwd.join(".rpi/dbg2.txt"), &text);
+            }
+            if let Some(current) = details_of(&text) {
+                if let Some(next) =
+                    crate::next_ready_wave(
+                    &current,
+                    max_parallel,
+                    binding,
+                    session,
+                    rpi_exe,
+                    wave.saturating_add(1),
+                )
+                {
+                    crate::effects().enqueue(next);
+                }
             }
             relay(task_id, &summarize(&text))
         }
@@ -189,6 +207,16 @@ fn run_launch(
             }
         }
     }
+}
+
+/// The graph details carried in a dispatch reply.
+///
+/// `dispatch` answers with `{"content":[...],"details":{"nodes":...,"taskId":...}}`,
+/// so the graph as the wave left it is inside the reply — the one description of
+/// the plan both the thread and the daemon can read.
+fn details_of(reply: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(reply).ok()?;
+    value.get("details").cloned()
 }
 
 /// Hand a wave's outcome to whatever can deliver it.
