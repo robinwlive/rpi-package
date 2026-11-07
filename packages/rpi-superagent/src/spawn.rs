@@ -152,6 +152,79 @@ fn session_id_if_named(path: &Path, name: &str) -> Option<String> {
     id
 }
 
+/// How big a named worker session has grown.
+///
+/// Returned so a caller can warn before a session gets expensive: a resumed
+/// session re-sends its whole history every turn, and the part that is *not*
+/// cached grows with it. A prefix hit is cheap per token, but a hundred thousand
+/// cached tokens every turn is still a hundred thousand tokens.
+///
+/// `None` when the session does not exist yet (the first run) or cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSize {
+    /// Bytes of the session file, which is a close enough proxy for its tokens.
+    pub bytes: u64,
+    /// Messages recorded, which is a close enough proxy for turns.
+    pub messages: usize,
+}
+
+impl SessionSize {
+    /// Whether this session is worth resuming or should be replaced.
+    ///
+    /// The thresholds are judgement, not measurement. At roughly 300 KB a session
+    /// is re-sending far more than it adds, and at 150 messages its early turns
+    /// have stopped being relevant to what it is doing now. Both are far from a
+    /// model's context limit on purpose: the cost is what is being managed here,
+    /// not the hard ceiling.
+    pub fn is_stale(&self) -> bool {
+        self.bytes > 300_000 || self.messages > 150
+    }
+
+    /// A one-line description for a tool result.
+    pub fn describe(&self) -> String {
+        format!("{} messages, {} KB", self.messages, self.bytes / 1024)
+    }
+}
+
+/// Measure a named worker session, if it exists.
+pub fn session_size(session_dir: &Path, name: &str) -> Option<SessionSize> {
+    let path = session_file(session_dir, name)?;
+    let bytes = std::fs::metadata(&path).ok()?.len();
+    let messages = std::fs::read_to_string(&path)
+        .ok()
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0);
+    Some(SessionSize { bytes, messages })
+}
+
+/// The file backing a named session.
+fn session_file(session_dir: &Path, name: &str) -> Option<std::path::PathBuf> {
+    let mut pending = std::collections::VecDeque::from([session_dir.to_path_buf()]);
+    let mut budget = 10_000usize;
+    while let Some(dir) = pending.pop_front() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push_back(path);
+                continue;
+            }
+            let text = path.to_string_lossy();
+            if !text.ends_with(".jsonl") || text.ends_with(".progress.jsonl") {
+                continue;
+            }
+            if session_id_if_named(&path, name).is_some() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// [`child_command`] with a choice of session handling.
 ///
 /// `session` names the worker's saved session. The host refuses `--session` for
@@ -863,6 +936,41 @@ mod tests {
                 (TIER_ENV.to_string(), "1".to_string()),
             ]
         );
+    }
+
+    /// The excluded list is part of the child's prompt, so its order has to be a
+    /// property of the set rather than of the edit that added a name. A different
+    /// order is a different prefix, which loses the provider's prefix cache — a
+    /// 30-50x difference on input for this provider.
+    #[test]
+    fn the_excluded_tools_are_sorted() {
+        let names: Vec<&str> = EXCLUDED_TOOLS.split(',').collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            names, sorted,
+            "EXCLUDED_TOOLS must be sorted, or the child's prompt changes for no reason"
+        );
+    }
+
+    #[test]
+    fn a_small_session_is_not_stale() {
+        let size = SessionSize { bytes: 1_000, messages: 5 };
+        assert!(!size.is_stale());
+        assert_eq!(size.describe(), "5 messages, 0 KB");
+    }
+
+    #[test]
+    fn a_large_session_is_stale() {
+        // Either dimension is enough: many messages, or a big file.
+        assert!(SessionSize { bytes: 400_000, messages: 1 }.is_stale());
+        assert!(SessionSize { bytes: 1_000, messages: 200 }.is_stale());
+    }
+
+    #[test]
+    fn a_missing_session_has_no_size() {
+        let dir = scratch_dir("no-session");
+        assert_eq!(session_size(&dir, "never-created"), None);
     }
 
     #[test]
