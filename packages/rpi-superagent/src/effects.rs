@@ -90,14 +90,34 @@ impl Binding {
     /// Read the binding out of a tool call's `params`, at enqueue time.
     ///
     /// Called from the tool thread, which is the last moment the host's handle is
-    /// available.
+    /// available. A failed lookup falls back to the session's last known binding
+    /// (see `host::parent_selection`), so a transient host failure does not
+    /// permanently lose the binding the row was queued with.
     pub fn from_params(params: &serde_json::Value) -> Self {
         let selection = crate::host::parent_selection(params);
-        Binding {
+        let binding = Binding {
             provider: selection.provider,
             model: selection.model,
             thinking: selection.thinking,
+        };
+        // Persist it beside the effect log so the daemon — which has no
+        // invocation handle and may be a different process entirely — can
+        // recover it if the row goes out with an empty binding.
+        if !binding.is_empty() {
+            if let Some(session) = crate::session_of(params) {
+                if let Ok(cwd) = std::env::current_dir() {
+                    let root = crate::effects_log::effects_root(&cwd);
+                    let _ = crate::effects_log::write_binding(
+                        &root,
+                        &session,
+                        binding.provider.as_deref(),
+                        binding.model.as_deref(),
+                        binding.thinking.as_deref(),
+                    );
+                }
+            }
         }
+        binding
     }
 
     /// Whether anything was captured.

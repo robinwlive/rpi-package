@@ -147,6 +147,7 @@ pub(super) fn dispatch_with(
         &crate::host::Selection,
         &Arc<Mutex<Vec<u32>>>,
         &str,
+        Option<&str>,
     ) -> Vec<(String, Result<String, String>)>,
 ) -> Result<String, String> {
     control.check()?;
@@ -239,29 +240,51 @@ pub(super) fn dispatch_with(
     // Without that a queued wave's children would resolve the *default* provider
     // rather than the one this session runs on.
     let parent = match params.get("binding") {
-        Some(binding) => crate::host::Selection {
-            provider: binding
-                .get("provider")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            model: binding
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            thinking: binding
-                .get("thinking")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            exe: params
-                .get("rpiExe")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        },
+        Some(binding) => {
+            let carried = crate::host::Selection {
+                provider: binding
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                model: binding
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                thinking: binding
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                exe: params
+                    .get("rpiExe")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            };
+            // The row recorded an empty binding (the session's lookup failed when
+            // it was queued). Inside the host this call still runs on the tool
+            // thread, so a live lookup can recover it; in the daemon there is no
+            // handle and this degrades to the empty row, which `run_launch`
+            // refuses to run on unbound nodes.
+            if carried.provider.is_none() && carried.model.is_none() {
+                let live = crate::host::parent_selection(params);
+                if live.provider.is_some() || live.model.is_some() {
+                    live
+                } else {
+                    carried
+                }
+            } else {
+                carried
+            }
+        }
         None => crate::host::parent_selection(params),
     };
     // One id for the wave, so every isolated node lands under the same run
     // directory and two waves never share one.
     let run_id = crate::workspace::run_id("wave");
+    // The session that asked for this wave. Workers' saved sessions live under
+    // a directory named after it, which is what lets a reader (Dash) attribute
+    // a worker file to the session that dispatched it — the worker's own header
+    // carries no parent field.
+    let parent_session = crate::session_of(params);
     let outcomes = run(
         &snapshot,
         &ready,
@@ -271,6 +294,7 @@ pub(super) fn dispatch_with(
         &parent,
         &pids,
         &run_id,
+        parent_session.as_deref(),
     );
 
     // Reject an already stale wave before running acceptance commands, then
@@ -582,6 +606,7 @@ pub(super) fn run_wave(
     parent: &crate::host::Selection,
     pids: &Arc<Mutex<Vec<u32>>>,
     run_id: &str,
+    parent_session: Option<&str>,
 ) -> Vec<(String, Result<String, String>)> {
     let mut out = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(max_parallel.max(1)) {
@@ -661,19 +686,15 @@ pub(super) fn run_wave(
                         // A named session resumes that worker; its directory is
                         // passed explicitly so worker history never lands in the
                         // user's repository.
-                        // One directory per **task** (I5): two tasks in the same
-                        // project would otherwise share this folder, and the second
-                        // `find_session_id` would resume the first one's worker
-                        // history — or collide outright with "already open in
-                        // another rpi process".
                         //
-                        // Task id rather than parent session id: a task belongs to
-                        // exactly one session (`superagent_plan` binds them), and it
-                        // is what is in scope here. Two sessions cannot share a task
-                        // id, so this separates parents just as well.
-                        let session_dir = crate::workspace::session_dir_for(
-                            graph.task_id.as_deref(),
-                        );
+                        // The directory level is the **parent session id**, so a
+                        // reader can tell whose worker a file is. A worker's own
+                        // header carries no parent field (the host writes only
+                        // id/cwd/version), so the path is the only attribution
+                        // available. Task id would separate two parents just as
+                        // well, but nothing could then map a worker back to the
+                        // session that dispatched it.
+                        let session_dir = crate::workspace::session_dir_for(parent_session);
                         // The task arrives as data inside a fence, so text that
                         // reads like a command stays text. The fixed part comes
                         // first, which is also what lets two workers share a

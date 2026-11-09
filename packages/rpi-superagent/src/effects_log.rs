@@ -762,3 +762,225 @@ mod tests {
         assert!(Log::open(&dir, "nothing").unwrap().load().is_empty());
     }
 }
+
+/// The binding a session last ran on, persisted beside its effect log.
+///
+/// Why on disk rather than only in memory: the background pass may run in a
+/// different process (the daemon) than the session that queued the wave. An
+/// in-process cache dies with the host; the file does not. Written whenever the
+/// host reports a binding, read back when a queued row carried none.
+///
+/// Deliberately separate from the log: the log is append-only queue state, and
+/// a binding is a "latest value" fact. Mixing them would make reading one
+/// require replaying the other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingRecord {
+    /// Format version; a newer one is ignored rather than misread.
+    pub v: u32,
+    /// The session this binding belongs to.
+    pub session: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+}
+
+/// Where a session's last-known binding is recorded.
+pub fn binding_path(effects_root: &Path, session: &str) -> PathBuf {
+    effects_root.join(format!("{}.binding.json", sanitize(session)))
+}
+
+/// Write the binding for `session`, replacing any previous one.
+///
+/// Written via a temporary file and renamed, so a reader never sees a half-written
+/// record: the daemon may read it at any moment.
+pub fn write_binding(
+    effects_root: &Path,
+    session: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    thinking: Option<&str>,
+) -> std::io::Result<()> {
+    if provider.is_none() && model.is_none() {
+        // Nothing worth recording: a binding without a provider/model cannot
+        // name the account a worker would run on.
+        return Ok(());
+    }
+    std::fs::create_dir_all(effects_root)?;
+    let record = BindingRecord {
+        v: VERSION,
+        session: session.to_string(),
+        provider: provider.map(str::to_string),
+        model: model.map(str::to_string),
+        thinking: thinking.map(str::to_string),
+    };
+    let final_path = binding_path(effects_root, session);
+    let temp_path = final_path.with_extension("binding.tmp");
+    let mut text = serde_json::to_string(&record).map_err(std::io::Error::other)?;
+    text.push('\n');
+    {
+        let mut file = File::create(&temp_path)?;
+        file.write_all(text.as_bytes())?;
+        file.flush()?;
+    }
+    std::fs::rename(&temp_path, &final_path)
+}
+
+/// Read back the binding recorded for `session`, if any.
+///
+/// A malformed or newer-versioned file yields `None` rather than an error: this
+/// is a best-effort fallback, and failing a wave because a cache file is
+/// unreadable would be worse than running unbound (which `run_launch` refuses
+/// for nodes that name nothing).
+pub fn read_binding(effects_root: &Path, session: &str) -> Option<BindingRecord> {
+    let text = std::fs::read_to_string(binding_path(effects_root, session)).ok()?;
+    let record: BindingRecord = serde_json::from_str(text.trim()).ok()?;
+    if record.v > VERSION || record.session != session {
+        return None;
+    }
+    Some(record)
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    /// A unique directory under the system temp dir, removed by `Dir`'s drop.
+    /// `tempfile` is not a dependency of this crate, and pulling one in for
+    /// four tests would be the tail wagging the dog.
+    struct Dir(std::path::PathBuf);
+    impl Dir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "rpi-superagent-binding-{}-{name}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Dir(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_binding_round_trips() {
+        let dir = Dir::new("round-trip");
+        let root = dir.path();
+        write_binding(root, "s1", Some("magpie"), Some("m-1"), Some("high")).unwrap();
+        let read = read_binding(root, "s1").expect("binding should be there");
+        assert_eq!(read.session, "s1");
+        assert_eq!(read.provider.as_deref(), Some("magpie"));
+        assert_eq!(read.model.as_deref(), Some("m-1"));
+        assert_eq!(read.thinking.as_deref(), Some("high"));
+    }
+
+    /// A second write replaces the first: the record is a latest-value fact, not
+    /// a log. This is what makes a model switch visible to the daemon.
+    #[test]
+    fn the_newest_binding_wins() {
+        let dir = Dir::new("the_newest_binding_wins");
+        let root = dir.path();
+        write_binding(root, "s1", Some("magpie"), Some("first"), None).unwrap();
+        write_binding(root, "s1", Some("magpie"), Some("second"), Some("off")).unwrap();
+        let read = read_binding(root, "s1").unwrap();
+        assert_eq!(read.model.as_deref(), Some("second"));
+        assert_eq!(read.thinking.as_deref(), Some("off"));
+    }
+
+    /// Bindings are per session. Handing one session's model to another is the
+    /// cross-account mistake this whole mechanism exists to prevent.
+    #[test]
+    fn bindings_do_not_leak_across_sessions() {
+        let dir = Dir::new("bindings_do_not_leak_across_sessions");
+        let root = dir.path();
+        write_binding(root, "s1", Some("magpie"), Some("m-1"), None).unwrap();
+        assert!(read_binding(root, "s2").is_none());
+    }
+
+    /// A binding without a provider and model cannot name an account, so it is
+    /// not worth recording.
+    #[test]
+    fn a_binding_without_a_model_is_not_recorded() {
+        let dir = Dir::new("a_binding_without_a_model_is_not_recorded");
+        let root = dir.path();
+        write_binding(root, "s1", None, None, Some("high")).unwrap();
+        assert!(read_binding(root, "s1").is_none());
+    }
+
+    /// A malformed file is a cache miss, not a failure: refusing a wave because
+    /// a cache file is unreadable would be worse than running without it.
+    #[test]
+    fn a_malformed_binding_file_is_ignored() {
+        let dir = Dir::new("a_malformed_binding_file_is_ignored");
+        let root = dir.path();
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(binding_path(root, "s1"), b"{not json").unwrap();
+        assert!(read_binding(root, "s1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod binding_recovery_tests {
+    use super::*;
+
+    /// The daemon recovers a binding the row lost, using what the session wrote
+    /// earlier. This is the whole point of the on-disk record: the row itself
+    /// arrives empty when the host reported nothing at enqueue time.
+    #[test]
+    fn a_lost_binding_is_recoverable_from_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-superagent-recover-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A successful capture records the binding.
+        write_binding(&dir, "parent", Some("magpie"), Some("m-1"), Some("high")).unwrap();
+
+        // A later row arrives with nothing in it.
+        let carried = crate::effects::Binding::default();
+        assert!(carried.is_empty());
+
+        // The recovery path finds the earlier record.
+        let recovered = read_binding(&dir, "parent").expect("binding should be recoverable");
+        assert_eq!(recovered.provider.as_deref(), Some("magpie"));
+        assert_eq!(recovered.model.as_deref(), Some("m-1"));
+        assert_eq!(recovered.thinking.as_deref(), Some("high"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model switch is visible to whoever reads the record next.
+    ///
+    /// This is the scenario the whole mechanism exists for: the settings default
+    /// is rate-limited, the user picks another model in the UI, and the worker
+    /// must follow the session rather than the settings file.
+    #[test]
+    fn a_model_switch_replaces_the_recorded_binding() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-superagent-switch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_binding(&dir, "s", Some("magpie"), Some("rate-limited"), Some("off")).unwrap();
+        write_binding(&dir, "s", Some("magpie"), Some("healthy"), Some("high")).unwrap();
+
+        let read = read_binding(&dir, "s").unwrap();
+        assert_eq!(read.model.as_deref(), Some("healthy"));
+        assert_eq!(read.thinking.as_deref(), Some("high"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -113,9 +113,36 @@ fn run_launch(
     // No binding and a node that names nothing means that worker resolves the
     // *settings default* — a different model than the session that queued the
     // wave. That is how a wave silently spends another account's quota and then
-    // fails with a rate-limit error the caller cannot explain. Refusing is the
-    // honest answer: the row cannot be repaired from here (the asking session's
-    // handle is gone), so it has to be re-queued from a session.
+    // fails with a rate-limit error the caller cannot explain.
+    //
+    // An empty row is not always hopeless: the host may have reported nothing at
+    // enqueue time while an earlier call in the same session did. Read the record
+    // that one left behind before refusing.
+    let recovered;
+    let binding = if binding.is_empty() {
+        recovered = session
+            .and_then(|id| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| {
+                        crate::effects_log::read_binding(
+                            &crate::effects_log::effects_root(&cwd),
+                            id,
+                        )
+                    })
+            })
+            .map(|record| crate::effects::Binding {
+                provider: record.provider,
+                model: record.model,
+                thinking: record.thinking,
+            });
+        match &recovered {
+            Some(found) if !found.is_empty() => found,
+            _ => binding,
+        }
+    } else {
+        binding
+    };
     if binding.is_empty() {
         let unbound: Vec<&str> = nodes
             .iter()

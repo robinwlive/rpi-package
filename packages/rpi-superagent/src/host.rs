@@ -53,6 +53,47 @@ struct RuntimeFns {
 
 static HOST: Mutex<Option<RuntimeFns>> = Mutex::new(None);
 
+/// The most recent binding the host successfully reported, per session id.
+///
+/// Why a cache exists at all: `GetExecutionContext` needs a live invocation
+/// handle, and the host deliberately stops honouring one once its tool call is
+/// over (a registration handle cannot assert it is a parent invocation — see
+/// `ChildAgent`'s authorisation in rpi). A background pass runs long after that,
+/// so it cannot ask again. Capturing at enqueue time is the design; this keeps
+/// the capture from being *lost* when a single lookup fails for a transient
+/// reason (a reload that dropped the bridge, a host mid-upgrade, a malformed
+/// reply).
+///
+/// Keyed by session id so two concurrent sessions on different models never
+/// see each other's binding; `None` is the key for "session unknown" and is
+/// only used when the host did not report one either.
+static LAST_KNOWN: Mutex<Option<(Option<String>, Selection)>> = Mutex::new(None);
+
+/// Remember `selection` as the last good binding for `session`.
+fn remember_binding(session: Option<&str>, selection: &Selection) {
+    if selection.provider.is_none() && selection.model.is_none() {
+        return;
+    }
+    *LAST_KNOWN.lock().unwrap_or_else(|error| error.into_inner()) =
+        Some((session.map(str::to_string), selection.clone()));
+}
+
+/// The last good binding for `session`, if one was ever recorded.
+///
+/// Matched strictly on the session id: a binding captured for another session
+/// belongs to that session's model, and handing it to a different one is the
+/// exact cross-account mistake this module exists to prevent.
+fn last_known_for(session: Option<&str>) -> Option<Selection> {
+    let cached = LAST_KNOWN
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    match cached {
+        Some((id, selection)) if id.as_deref() == session => Some(selection),
+        _ => None,
+    }
+}
+
 /// Capture the host action bridge. Called once from the plugin entrypoint.
 pub(crate) fn install(plugin: &rpi_plugin_sdk::PluginApi) {
     *HOST.lock().unwrap_or_else(|error| error.into_inner()) = Some(RuntimeFns {
@@ -211,17 +252,44 @@ pub(crate) fn registered_tool_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Read the calling session's binding from the host. Best-effort by design: a
-/// missing bridge, a missing handle, a failing action or a malformed reply all
-/// yield an empty selection.
+/// Read the calling session's binding from the host.
+///
+/// Falls back to the last binding this session successfully reported when the
+/// live lookup yields nothing. That case is not hypothetical: the host only
+/// honours an invocation handle while its tool call is in flight, and a
+/// transient failure (reload dropping the bridge, a malformed reply) is
+/// indistinguishable from "this host never supports it". Reusing the previous
+/// answer keeps a worker on the session's model instead of silently dropping to
+/// the settings default.
+///
+/// Still best-effort: with no live answer *and* nothing remembered, the caller
+/// gets an empty selection and must decide what to do (see
+/// `effects_handler::run_launch`, which refuses rather than letting workers run
+/// on an account the caller never chose).
 pub(crate) fn parent_selection(params: &Value) -> Selection {
+    let session = crate::session_of(params);
     let Some(host) = *HOST.lock().unwrap_or_else(|error| error.into_inner()) else {
-        return Selection::default();
+        return last_known_for(session.as_deref()).unwrap_or_default();
     };
-    select_with(
+    let live = select_with(
         |handle| call_host(&host, handle, GET_EXECUTION_CONTEXT, &serde_json::json!({})),
         params,
-    )
+    );
+    if live.provider.is_some() || live.model.is_some() {
+        // `thinking` alone is not worth remembering: a selection with no model
+        // cannot name the account a worker would run on.
+        remember_binding(session.as_deref(), &live);
+        return live;
+    }
+    match last_known_for(session.as_deref()) {
+        Some(mut remembered) => {
+            if remembered.exe.is_none() {
+                remembered.exe = live.exe;
+            }
+            remembered
+        }
+        None => live,
+    }
 }
 
 /// Look the binding up through `lookup`, which receives the invocation handle.
@@ -597,6 +665,56 @@ mod tests {
         assert_eq!(
             select_with(|_| Ok(json!({"unexpected": true})), &params),
             Selection::default()
+        );
+    }
+}
+
+#[cfg(test)]
+mod binding_cache_tests {
+    use super::*;
+
+    /// A remembered binding is only handed back to the session that recorded it.
+    ///
+    /// Two sessions can run on different accounts; reusing one's model for the
+    /// other is precisely the cross-account mistake this module prevents.
+    #[test]
+    fn a_remembered_binding_is_bound_to_its_session() {
+        let selection = Selection {
+            provider: Some("magpie".into()),
+            model: Some("m-1".into()),
+            thinking: Some("high".into()),
+            exe: None,
+        };
+        remember_binding(Some("session-a"), &selection);
+        assert_eq!(
+            last_known_for(Some("session-a")).and_then(|s| s.model),
+            Some("m-1".into())
+        );
+        assert!(last_known_for(Some("session-b")).is_none());
+        assert!(last_known_for(None).is_none());
+    }
+
+    /// A selection with no provider and model cannot name an account, so it must
+    /// not overwrite a good one.
+    #[test]
+    fn an_empty_binding_does_not_clobber_a_good_one() {
+        let good = Selection {
+            provider: Some("magpie".into()),
+            model: Some("m-1".into()),
+            thinking: None,
+            exe: None,
+        };
+        remember_binding(Some("session-c"), &good);
+        remember_binding(
+            Some("session-c"),
+            &Selection {
+                thinking: Some("max".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            last_known_for(Some("session-c")).and_then(|s| s.model),
+            Some("m-1".into())
         );
     }
 }
