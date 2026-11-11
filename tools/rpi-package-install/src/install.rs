@@ -283,6 +283,7 @@ pub fn run(opts: &Options) -> Result<Vec<PathBuf>> {
 fn replace_file(src: &Path, dst: &Path) -> Result<Option<PathBuf>> {
     if std::fs::copy(src, dst).is_ok() {
         verify(src, dst)?;
+        resign(dst)?;
         return Ok(None);
     }
     if !dst.exists() {
@@ -290,6 +291,7 @@ fn replace_file(src: &Path, dst: &Path) -> Result<Option<PathBuf>> {
         std::fs::copy(src, dst)
             .with_context(|| format!("cannot copy {} to {}", src.display(), dst.display()))?;
         verify(src, dst)?;
+        resign(dst)?;
         return Ok(None);
     }
 
@@ -308,7 +310,46 @@ fn replace_file(src: &Path, dst: &Path) -> Result<Option<PathBuf>> {
         )
     })?;
     verify(src, dst)?;
+    resign(dst)?;
     Ok(Some(backup))
+}
+
+/// Re-sign a copied Mach-O on macOS.
+///
+/// Why this is mandatory, not cosmetic (2026-11-07): a cdylib built by cargo
+/// is **linker-signed**, and that signature records the file's mtime at build
+/// time. `std::fs::copy` sets a **new** mtime on the copy, so the recorded
+/// `cs_mtime` no longer matches the file — and the kernel then **refuses to
+/// map the page and kills the host process**:
+///
+/// ```text
+/// CODE SIGNING: process 60948[rpi]: rejecting invalid page at address 0x…
+///   in file ".../extensions/librpi_superagent.dylib"
+///   (cs_mtime:1794032414.595107644 != mtime:1794050943.121659973)
+/// ```
+///
+/// The symptom is silent: no stderr, exit code 137, and **every** rpi session
+/// that loads the extension dies at startup — which reads as "new sessions
+/// cannot be created at all".
+///
+/// `codesign -v` still reports the file as valid, so a signature check does
+/// not catch this; only an ad-hoc re-sign does.
+fn resign(path: &Path) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let status = std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(path)
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => bail!(
+            "re-signing {} failed (exit {s}): the host will refuse to load it",
+            path.display()
+        ),
+        Err(e) => bail!("cannot run codesign for {}: {e}", path.display()),
+    }
 }
 
 fn verify(src: &Path, dst: &Path) -> Result<()> {
@@ -438,6 +479,42 @@ mod tests {
         std::fs::write(&src, b"other").unwrap();
         assert!(verify(&src, &dst).is_err());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A copied Mach-O must be re-signed, or the host dies at startup.
+    ///
+    /// 2026-11-07: `librpi_superagent.dylib` was copied into the extension dir
+    /// without a re-sign. The copy's mtime no longer matched the `cs_mtime` in
+    /// the linker signature, so the kernel refused to map the page and killed
+    /// rpi — silently, with no stderr and exit code 137. Every new session
+    /// then failed to start at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_copied_dylib_is_resigned_so_the_kernel_accepts_it() {
+        let tmp = std::env::temp_dir().join("rpi-pkg-install-resign");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("built.dylib");
+        let dst = tmp.join("installed.dylib");
+        // A real Mach-O so codesign has something to sign.
+        let fixture = "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation";
+        if std::fs::copy(fixture, &src).is_err() {
+            return; // No usable fixture on this machine; nothing to assert.
+        }
+        std::fs::copy(&src, &dst).unwrap();
+        // The copy alone is not enough: its mtime differs from the signature.
+        resign(&dst).unwrap();
+        let out = std::process::Command::new("/usr/bin/codesign")
+            .args(["-d", "--verbose=4"])
+            .arg(&dst)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !text.contains("linker-signed"),
+            "the installed dylib must not stay linker-signed: {text}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
