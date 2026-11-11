@@ -264,6 +264,17 @@
     "prebuilt_manifest": "https://github.com/pi-rust/rpi-package/releases/download/rpi-edit-diagnostics-v0.1.3/rpi-extension.json"
   },
   {
+    "name": "rpi-hashline",
+    "version": "0.2.0",
+    "type": "extension",
+    "tool": "hash_read + hash_edit (line-number anchors)",
+    "inspiredBy": "hashline edit addressing (oh-my-pi, MIT)",
+    "sourceDownloadsPerMonth": null,
+    "install": "rpi install rpi-hashline --path packages/rpi-hashline",
+    "repository": "https://github.com/pi-rust/rpi-package",
+    "prebuilt_manifest": null
+  },
+  {
     "name": "rpi-http",
     "version": "0.2.2",
     "type": "extension",

@@ -1,0 +1,19 @@
+[package]
+name = "rpi-hashline"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Content-hash line anchors for the rpi agent: read tags every line, edit points at anchors instead of retyping text"
+readme = "README.md"
+keywords = ["rpi", "edit", "hashline", "anchor", "plugin"]
+categories = ["development-tools"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rpi-plugin-sdk = { workspace = true }
+serde_json = { workspace = true }
