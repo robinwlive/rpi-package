@@ -29,24 +29,29 @@ const ROOT: &str = ".rpi/superagent-work";
 /// The directory that holds workers' saved sessions.
 const SESSION_ROOT: &str = ".rpi/superagent-sessions";
 
-/// Where a worker's saved session lives, for a parent session.
+/// Where a worker's saved session lives.
+///
+/// The directory level is the **parent session id**. That is what makes a
+/// worker attributable to the session that dispatched it: a worker's own file
+/// records only `id`/`cwd`/`version` — the host never writes a parent field —
+/// and its `--name` is `<taskId>-<nodeId>`, which does not name the parent
+/// either. A task id is unique per session, so it separates two parents just as
+/// well, and that was this argument's value until a reader needed to know
+/// *whose* worker a file was.
 ///
 /// Passed to the child explicitly because the host's default would be the
 /// parent project's `.rpi/sessions/`, mixing worker history into the user's
 /// repository.
 ///
-/// **The parent session id is part of the path.** One directory for the whole
-/// project means two parent sessions in the same project each write
-/// `<name>.jsonl` under the same folder: the second `find_session_id` resolves
-/// the *first* parent's file and resumes a stranger's history — or the two
-/// collide outright with "already open in another rpi process". One directory
-/// per parent keeps them physically apart.
+/// One directory per parent also keeps two parents' workers apart: they would
+/// otherwise write `<name>.jsonl` under the same folder, and the second
+/// `find_session_id` would resolve the *first* parent's file and resume a
+/// stranger's history — or the two would collide outright with "already open
+/// in another rpi process".
 ///
-/// With no parent id there is nothing to separate, so the old flat directory is
-/// used: the behaviour is unchanged for callers that never had an id.
-///
-/// Returns `None` when there is no usable working directory; the caller then
-/// leaves the child ephemeral.
+/// Falls back to the flat directory when there is no parent id, so a caller
+/// that never had one behaves exactly as before. Returns `None` when there is
+/// no usable working directory; the caller then leaves the child ephemeral.
 pub fn session_dir_for(parent_session_id: Option<&str>) -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let dir = match parent_session_id.map(sanitize).filter(|id| !id.is_empty()) {

@@ -57,6 +57,53 @@ pub const ENV_THINKING: &str = "RPI_THINKING";
 /// environment, so all three are removed and nothing is left to leak.
 pub const BRIDGE_ENV: &[&str] = &["PI_DINGO_BRIDGE", "PI_DINGO_URL", "PI_DINGO_TOKEN"];
 
+/// The agent directory a worker reads `models.json` from.
+///
+/// Why this is resolved instead of inherited: `RPI_CODING_AGENT_DIR` points at a
+/// directory Dash may have **moved** (15 §5.4 moved `~/.pi/agent/pidingo` to
+/// `~/.pidd`). A session started before the move still carries the old path in
+/// its environment; the old directory is then re-created empty by the host, the
+/// worker finds no `models.json`, and every provider fails with
+/// `Unknown provider "magpie"` (observed 2026-11-07 — every dispatched worker
+/// died that way).
+///
+/// Resolution: keep the inherited directory when it still holds `models.json`;
+/// otherwise fall back to the current Dash data home (`~/.pidd/rpi-agent`).
+/// Never guess a provider — a missing model file must not silently become
+/// "some other account".
+pub const AGENT_DIR_ENV: &str = "RPI_CODING_AGENT_DIR";
+
+/// The worker agent directory: the inherited one if it still has `models.json`,
+/// else `<data home>/rpi-agent`.
+pub(crate) fn worker_agent_dir() -> std::path::PathBuf {
+    worker_agent_dir_from(
+        std::env::var_os(AGENT_DIR_ENV).map(std::path::PathBuf::from),
+        std::env::var_os("PI_DINGO_HOME").map(std::path::PathBuf::from),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+    )
+}
+
+/// The pure form of [`worker_agent_dir`], so the rule can be tested without
+/// mutating the process environment (this crate denies `unsafe`).
+fn worker_agent_dir_from(
+    inherited: Option<std::path::PathBuf>,
+    dingo_home: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(dir) = inherited.as_ref() {
+        if dir.join("models.json").exists() {
+            return dir.clone();
+        }
+    }
+    // `PI_DINGO_HOME` is Dash's own override (15 §5.3); fall back to it before
+    // the hardcoded default so a sandboxed run stays inside the sandbox.
+    let base = dingo_home
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| home.map(|h| h.join(".pidd")))
+        .unwrap_or_else(|| std::path::PathBuf::from(".pidd"));
+    base.join("rpi-agent")
+}
+
 /// How often the wait loop re-checks cancellation/timeout. Bounds how long a
 /// cancelled call can keep a child alive.
 pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
@@ -265,6 +312,9 @@ pub fn child_command_with_session(
     for name in BRIDGE_ENV {
         command.env_remove(name);
     }
+    // The agent dir must point at a directory that still holds `models.json`.
+    // See [`worker_agent_dir`] for why the inherited value cannot be trusted.
+    command.env(AGENT_DIR_ENV, worker_agent_dir());
     command
         // Hard turn ceiling enforced by the harness, not the model.
         .env(MAX_TURNS_ENV, max_turns.to_string())
@@ -1673,6 +1723,12 @@ mod tests {
                 ("PI_DINGO_BRIDGE".to_string(), String::new()),
                 ("PI_DINGO_TOKEN".to_string(), String::new()),
                 ("PI_DINGO_URL".to_string(), String::new()),
+                // The agent dir is re-pointed at a directory that still has
+                // `models.json` — the inherited one may have been moved away.
+                (
+                    AGENT_DIR_ENV.to_string(),
+                    worker_agent_dir().to_string_lossy().into_owned(),
+                ),
                 (MAX_TURNS_ENV.to_string(), "7".to_string()),
                 (SUBAGENT_ENV.to_string(), "1".to_string()),
                 // A plan dispatched from a person's session is generation zero, so
@@ -1695,6 +1751,42 @@ mod tests {
             names, sorted,
             "EXCLUDED_TOOLS must be sorted, or the child's prompt changes for no reason"
         );
+    }
+
+    /// The worker's agent dir must be a directory that still holds
+    /// `models.json`. A session started before Dash moved its data home still
+    /// carries the old path; the worker then finds no credentials and every
+    /// provider fails with `Unknown provider "magpie"` (2026-11-07).
+    #[test]
+    fn the_worker_agent_dir_falls_back_when_the_inherited_one_is_empty() {
+        let tmp = std::env::temp_dir().join(format!("pidd-agent-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Inherited dir exists but has no models.json -> must not be used.
+        std::fs::create_dir_all(&tmp).unwrap();
+        let resolved = worker_agent_dir_from(
+            Some(tmp.clone()),
+            Some(std::path::PathBuf::from("/data/home")),
+            Some(std::path::PathBuf::from("/home/u")),
+        );
+        assert_ne!(
+            resolved, tmp,
+            "an inherited agent dir without models.json must be rejected"
+        );
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from("/data/home/rpi-agent"),
+            "the fallback must land in the Dash data home"
+        );
+
+        // With models.json present, the inherited dir wins.
+        std::fs::write(tmp.join("models.json"), "{}").unwrap();
+        let resolved = worker_agent_dir_from(
+            Some(tmp.clone()),
+            Some(std::path::PathBuf::from("/data/home")),
+            Some(std::path::PathBuf::from("/home/u")),
+        );
+        assert_eq!(resolved, tmp, "a usable inherited dir must be kept");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
 

@@ -493,11 +493,21 @@ mod tests {
             &params,
             &control,
             &progress,
-            |graph, ready, parallel, control, progress, parent, pids, run_id| {
+            |graph, ready, parallel, control, progress, parent, pids, run_id, parent_session| {
                 // Cancel after dispatch marks the ready set running, but
                 // before run_wave starts its first chunk. No child may run.
                 control.cancel();
-                crate::dispatch::run_wave(graph, ready, parallel, control, progress, parent, pids, run_id)
+                crate::dispatch::run_wave(
+                    graph,
+                    ready,
+                    parallel,
+                    control,
+                    progress,
+                    parent,
+                    pids,
+                    run_id,
+                    parent_session,
+                )
             },
         )
         .unwrap();
@@ -521,7 +531,8 @@ mod tests {
                        _: &crate::kit::Progress,
                        _: &crate::host::Selection,
                        _: &std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
-                       _: &str| {
+                       _: &str,
+                       _: Option<&str>| {
             ready
                 .iter()
                 .map(|id| (id.clone(), Ok("fixture success".into())))
@@ -571,7 +582,7 @@ mod tests {
                 &wave_params,
                 &wave_control,
                 &std::sync::mpsc::channel().0,
-                |_, ready, _, _, _, _, _, _| {
+                |_, ready, _, _, _, _, _, _, _| {
                     ready
                         .iter()
                         .map(|id| (id.clone(), Ok("fixture result".into())))
