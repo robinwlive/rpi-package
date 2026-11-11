@@ -56,7 +56,7 @@
   },
   {
     "name": "rpi-btw",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "type": "extension",
     "tool": "/btw (independent read-only side questions)",
     "inspiredBy": "Out-of-band assistant questions",
@@ -273,5 +273,16 @@
     "install": "rpi install rpi-edit-diagnostics",
     "repository": "https://github.com/pi-rust/rpi-package",
     "prebuilt_manifest": "https://github.com/pi-rust/rpi-package/releases/download/rpi-edit-diagnostics-v0.1.1/rpi-extension.json"
+  },
+  {
+    "name": "rpi-hashline",
+    "version": "0.2.0",
+    "type": "extension",
+    "tool": "hash_read + hash_edit (line-number anchors)",
+    "inspiredBy": "hashline edit addressing (oh-my-pi, MIT)",
+    "sourceDownloadsPerMonth": null,
+    "install": "rpi install rpi-hashline",
+    "repository": "https://github.com/pi-rust/rpi-package",
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-package/releases/download/rpi-hashline-v0.2.0/rpi-extension.json"
   }
 ]
