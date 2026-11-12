@@ -689,6 +689,33 @@ mod tests {
         assert_eq!(rendered.lines().last().unwrap(), "[x] ok done — x");
     }
 
+    /// A node whose dependency was cancelled out from under it must not be ready.
+    ///
+    /// `ready()` asks "are all deps done". That is right for the normal case, but a
+    /// dep that was **removed** by `removeIds` returns `unwrap_or(false)`, so the
+    /// dependent waits forever — and `propagate_skips` only skips a dependent of a
+    /// *failed or skipped* dep, not of a dep that no longer exists. The result is a
+    /// node that is neither ready nor skipped: `dispatch` reports "no progress"
+    /// and the plan stalls with nothing visibly wrong.
+    #[test]
+    fn a_node_whose_dependency_vanished_is_not_ready() {
+        let mut g = graph(json!([
+            {"id": "a", "task": "x"},
+            {"id": "b", "task": "y", "deps": ["a"]}
+        ]));
+        // Drop the dependency without touching `b`, as a partial edit can.
+        g.nodes.retain(|node| node.id != "a");
+        assert!(
+            !g.ready().contains(&"b".to_string()),
+            "b became ready with a missing dependency"
+        );
+        // And it must not silently run the moment the missing dep is treated as
+        // satisfied; the honest outcome is "skipped", which `propagate_skips`
+        // produces once the dangling dep is dropped from `b`.
+        g.propagate_skips();
+        assert_eq!(g.get("b").unwrap().status, Status::Pending);
+    }
+
     /// A person asking "what is each worker doing" must get an answer from the
     /// plan, not from their memory of the call that wrote it.
     #[test]

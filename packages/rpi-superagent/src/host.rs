@@ -396,16 +396,51 @@ fn call_host(host: &RuntimeFns, handle: usize, action: u32, args: &Value) -> Res
     );
     let text = out.to_string_lossy();
     (host.free)(out);
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("invalid execution-context reply (status {rc}): {error}"))?;
+    // The status is checked **first**. Parsing first and reporting the parse error
+    // meant that a failing action whose reply was empty or not JSON lost its real
+    // cause: the caller saw "invalid reply", never "the host refused this", and
+    // there was nothing to act on. A host is free to answer an error with plain
+    // text or with nothing at all.
     if rc != 0 {
-        return Err(value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("execution-context lookup failed")
-            .to_string());
+        return Err(describe_action_failure(rc, &text));
     }
-    Ok(value)
+    serde_json::from_str(&text).map_err(|error| {
+        format!("invalid execution-context reply (status {rc}): {error}")
+    })
+}
+
+/// The message for a host action that returned a non-zero status.
+///
+/// A host may answer an error with `{"error": "..."}`, with plain text, or with
+/// nothing at all. Every one of those has to produce something a caller can act
+/// on: reporting "invalid reply" for an empty body hid the real cause and left
+/// nothing to do about it.
+fn describe_action_failure(rc: i32, text: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Some(message) = value.get("error").and_then(Value::as_str) {
+            let message = message.trim();
+            if !message.is_empty() {
+                return message.to_string();
+            }
+        }
+    }
+    let trimmed = text.trim();
+    // A body that carried no usable message — empty, or a JSON object whose error
+    // field was blank (handled above, so this is any other all-blank object) — says
+    // nothing a reader can act on, so the status is the better report.
+    let says_nothing = trimmed.is_empty()
+        || serde_json::from_str::<Value>(trimmed)
+            .ok()
+            .is_some_and(|value| match &value {
+                Value::Object(fields) => fields.values().all(|field| {
+                    field.as_str().map(str::trim).is_none_or(str::is_empty)
+                }),
+                _ => false,
+            });
+    if says_nothing {
+        return format!("the host action failed with status {rc} and no message");
+    }
+    trimmed.to_string()
 }
 
 /// Whether this host exits as soon as the current turn ends.
@@ -666,6 +701,49 @@ mod tests {
             select_with(|_| Ok(json!({"unexpected": true})), &params),
             Selection::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod action_failure_tests {
+    use super::*;
+
+    /// A failing action must report the cause, whatever shape the reply took.
+    ///
+    /// The status used to be checked *after* parsing, so an error reply that was
+    /// empty or not JSON produced "invalid reply (status N)" — the parse failure
+    /// overwrote the real cause and left the caller nothing to act on.
+    #[test]
+    fn a_failure_reports_the_hosts_own_message() {
+        assert_eq!(
+            describe_action_failure(3, r#"{"error":"no such session"}"#),
+            "no such session"
+        );
+    }
+
+    #[test]
+    fn a_failure_with_plain_text_keeps_the_text() {
+        assert_eq!(
+            describe_action_failure(3, "bridge not attached"),
+            "bridge not attached"
+        );
+    }
+
+    #[test]
+    fn a_failure_with_no_body_names_the_status() {
+        let message = describe_action_failure(7, "   ");
+        assert!(message.contains("status 7"), "got: {message}");
+        assert!(
+            !message.contains("invalid"),
+            "an empty reply was reported as a parse error: {message}"
+        );
+    }
+
+    /// A well-formed but message-less error object still has to say something.
+    #[test]
+    fn a_failure_with_an_empty_error_field_falls_back_to_the_status() {
+        let message = describe_action_failure(2, r#"{"error":""}"#);
+        assert!(message.contains("status 2"), "got: {message}");
     }
 }
 

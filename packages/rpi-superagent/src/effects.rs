@@ -677,24 +677,25 @@ impl Effects {
                     .entry(kind)
                     .and_modify(|count| *count = count.saturating_add(1))
                     .or_insert(1);
-                let attempts = self
+                // Looked up by the **row** key, the same one `settle` was given
+                // and the same one the row is stored under. Matching on
+                // `effect.key()` (the bare task id) found nothing whenever a
+                // session was named or the wave was not 0 — so the log recorded a
+                // constant `attempts` instead of the real count.
+                let found = self
                     .rows
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .iter()
-                    .find(|row| row.effect.kind() == kind && row.effect.key() == key)
-                    .map(|row| row.attempts)
-                    .unwrap_or(1);
-                let effect = self
-                    .rows
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .find(|row| row.effect.kind() == kind && row.effect.key() == key)
-                    .map(|row| row.effect.clone());
-                if let Some(effect) = effect {
-                    self.record(&effect, seq, attempts, Some(message));
-                }
+                    .find(|row| row.effect.kind() == kind && row.key() == key)
+                    .map(|row| (row.attempts, row.effect.clone()));
+                let (attempts, effect) = match found {
+                    Some(pair) => pair,
+                    // The row was removed between the two locks (cancelled while
+                    // its failure was being recorded). Nothing to record against.
+                    None => return,
+                };
+                self.record(&effect, seq, attempts, Some(message));
             }
         }
     }
@@ -864,6 +865,88 @@ mod tests {
             2,
             "one session's launch replaced the other's"
         );
+    }
+
+    /// A finished row must actually leave the queue.
+    ///
+    /// `dispatch` passes the **row** key (`sess/T1#0`) into `settle`, but the
+    /// bookkeeping afterwards looked the row up by `effect.key()` (bare `T1`).
+    /// Those differ whenever a session is named or a wave is not 0, so the lookup
+    /// found nothing, `attempts` fell back to a constant, and the failure was
+    /// recorded under the wrong key. A row whose outcome cannot be matched is
+    /// silently dropped — the work is done and the queue still holds it.
+    #[test]
+    fn a_settled_failure_is_recorded_under_the_row_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-superagent-settle-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = crate::effects_log::Log::open(&dir, "owner").unwrap();
+        let queue = Effects::durable(log);
+        queue.enqueue(Effect::Launch {
+            task_id: "T1".into(),
+            nodes: vec!["a".into()],
+            max_parallel: 1,
+            binding: Binding::default(),
+            session: Some("sess-A".into()),
+            graph: None,
+            rpi_exe: None,
+            wave: 3,
+        });
+        // Fails once: the row must stay queued with attempts = 1.
+        queue.dispatch(|_| Err(Outcome::Failed("boom".into())));
+        let rows = queue.rows();
+        assert_eq!(rows.len(), 1, "the failed row vanished: {rows:?}");
+        assert_eq!(
+            rows[0].attempts, 1,
+            "the attempt was not counted on the row it belongs to"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The logged retry count must be the row's real count.
+    ///
+    /// The bookkeeping looked the row up by bare task id while the row was stored
+    /// under `sess/T1#wave`, so the lookup missed and a constant was logged. A
+    /// person reading the log then sees "attempt 1" forever, on a row that has
+    /// been retried six times.
+    #[test]
+    fn the_log_records_the_rows_real_attempt_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-superagent-attempts-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = crate::effects_log::Log::open(&dir, "owner").unwrap();
+        let queue = Effects::durable(log);
+        queue.enqueue(Effect::Launch {
+            task_id: "T1".into(),
+            nodes: vec!["a".into()],
+            max_parallel: 1,
+            binding: Binding::default(),
+            session: Some("sess-A".into()),
+            graph: None,
+            rpi_exe: None,
+            wave: 2,
+        });
+        queue.dispatch(|_| Err(Outcome::Failed("boom".into())));
+        // Make it due again so the second attempt actually runs.
+        {
+            let mut rows = queue.rows.lock().unwrap_or_else(|e| e.into_inner());
+            rows[0].due = Instant::now();
+        }
+        queue.dispatch(|_| Err(Outcome::Failed("boom".into())));
+
+        let reloaded = crate::effects_log::Log::open(&dir, "owner").unwrap().load();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(
+            reloaded[0].attempts, 2,
+            "the log recorded the wrong attempt count for the row"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
