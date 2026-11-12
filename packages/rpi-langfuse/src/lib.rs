@@ -3260,9 +3260,10 @@ mod tests {
             score["properties"]["action"]["enum"],
             json!(["create", "list"])
         );
-        // Strict OpenAI-schema validators reject union type arrays, so the
-        // value field declares no type and accepts any JSON value.
-        assert!(score["properties"]["value"].get("type").is_none());
+        assert_eq!(
+            score["properties"]["value"]["type"],
+            json!(["number", "string", "object"])
+        );
         assert_eq!(prompt["properties"]["version"]["minimum"], 0);
         for schema in [&score, &prompt] {
             assert_eq!(schema["properties"]["limit"]["minimum"], 1);
