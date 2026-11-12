@@ -107,6 +107,21 @@ pub(crate) fn next_ready_wave(
     wave: u64,
 ) -> Option<effects::Effect> {
     let rebuilt = graph::Graph::from_details(graph).ok()?;
+    // A node marked `confirmBeforeNext` just finished, so the next wave waits for
+    // a decision instead of running on. Checked here rather than at the caller:
+    // both the in-process scheduler and the daemon come through this function,
+    // and a gate only one of them honoured would be a gate that leaks.
+    //
+    // Only a *finished* gate holds: the same plan is dispatched again on purpose
+    // when the model has decided, and by then that node is still `done` — so the
+    // hold is on the automatic continuation, not on an explicit dispatch.
+    if let Some(gate) = rebuilt.nodes.iter().find(|node| {
+        node.confirm_before_next
+            && matches!(node.status, graph::Status::Done | graph::Status::Failed)
+    }) {
+        let _ = gate;
+        return None;
+    }
     let ready = rebuilt.ready();
     if ready.is_empty() {
         return None;

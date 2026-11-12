@@ -3,6 +3,27 @@
 Long-task orchestration for the `rpi` Rust agent: a bounded DAG execution
 kernel plus a small layer that keeps a task alive across restarts.
 
+## 这个插件的目标：一间公司
+
+人和 agent 的关系，是一个**明确的分工**，不是一个聪明的自动化：
+
+| 角色 | 是谁 | 职责 |
+| --- | --- | --- |
+| **老板** | 你 | 定目标；项目经理拍不了板的事，问你 |
+| **项目经理** | 主会话 | 接你的需求，拆活、派人、看进度、决定下一步。**所有工作安排和进度调整都由它完成** |
+| **员工** | 子会话 | 只做被派的那一件事，做完交报告。彼此异步，可以同时有多个 |
+
+规则只有三条，但每条都是硬约束：
+
+1. **任何工作都扔给员工做。** 主会话不自己动手干活，它派人。
+2. **员工异步。** 派出去就回来，主会话继续和你对话。员工什么时候开始、
+   结束了以后下一步做什么，都由项目经理决定 —— 不是由引擎自动接续。
+3. **老板按需查看，不看不打扰。** 你想知道每个员工在做什么、做到什么程度，
+   随时能问；你不想知道，就没有汇报来打扰你。
+
+第 3 条是这套设计里最容易做错的一条：**有进度可查**和**主动汇报**是两件事。
+员工干完活，报告进主会话的账本；主会话觉得需要你知道，才告诉你。
+
 > **Goal** — 把「一个长任务」从「人盯着它跑」变成「人只在需要裁决时才出现」。
 > (*Turn "a long job" from "you watch it run" into "you show up only when a
 > decision is needed."*)
@@ -44,7 +65,7 @@ unified plugin ABI).
 
 | Tool | Purpose |
 | --- | --- |
-| `superagent_plan` | Author or edit the task DAG: `set` replaces nodes, `update` applies `addNodes` / `removeIds` / `setDeps` / `reset` atomically, `show` inspects. |
+| `superagent_plan` | Author or edit the task DAG: `set` replaces nodes, `update` applies `addNodes` / `removeIds` / `setDeps` / `reset` atomically, `show` inspects. A node with `confirmBeforeNext: true` stops the automatic next wave until the project manager decides. |
 | `superagent_dispatch` | Queue one wave and return at once: every pending node whose dependencies are done at wave start, in batches up to `maxParallel`. A wave that unblocks more nodes queues the next one itself; the report arrives as a message. |
 | `superagent_task` | Track a long task across restarts: `create` it, `update` its state, `list` them. |
 

@@ -141,6 +141,18 @@ pub struct Node {
     /// Why a node failed. `render` shows it so a blocked Ticket is explainable
     /// to a human, not just marked `!`.
     pub error: Option<String>,
+    /// Stop the automatic next wave after this node finishes.
+    ///
+    /// The engine normally queues the next ready wave by itself once a wave ends,
+    /// so a plan written once runs to completion without asking again. That is
+    /// the right default: the plan *is* the project manager's decision, and
+    /// re-confirming every wave just makes a long plan slower.
+    ///
+    /// This is the exception a "decide before the next step" node needs. When a
+    /// node marked here finishes, the next wave is **not** queued: the report
+    /// goes back to the session, and the model decides what to do next. Costs one
+    /// round trip, buys back the ability to change course at exactly one point.
+    pub confirm_before_next: bool,
     /// When this node's child started, in ms since the epoch; 0 when it has not.
     ///
     /// Without it "how far along is it" has no answer a caller can trust: a
@@ -200,6 +212,10 @@ impl Node {
             }
             None => None,
         };
+        let confirm_before_next = value
+            .get("confirmBeforeNext")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let expect_file = string_field(value, "expectFile");
         let verify = string_field(value, "verify");
         let session = string_field(value, "session");
@@ -236,6 +252,7 @@ impl Node {
             status: Status::Pending,
             result: None,
             error: None,
+            confirm_before_next,
             started_at: 0,
         })
     }
@@ -251,6 +268,7 @@ impl Node {
             "thinking": self.thinking,
             "isolation": self.isolation,
             "expectFile": self.expect_file,
+            "confirmBeforeNext": self.confirm_before_next,
             "verify": self.verify,
             "session": self.session,
             "maxTurns": self.max_turns,
@@ -367,6 +385,13 @@ impl Graph {
             // plan back and continues it must not lose when each child started,
             // or the elapsed time resets to "just now" on every wave.
             node.started_at = item.get("startedAt").and_then(Value::as_u64).unwrap_or(0);
+            // Same reason as `started_at`: a wave that reads the plan back must
+            // not lose the gate, or the next wave would resume past a node the
+            // project manager asked to decide on first.
+            node.confirm_before_next = item
+                .get("confirmBeforeNext")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             built.push(node);
         }
         let graph = Graph {

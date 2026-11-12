@@ -588,6 +588,66 @@ mod tests {
         }
     }
 
+    /// A node marked `confirmBeforeNext` stops the automatic next wave.
+    ///
+    /// The plan is the project manager's decision, so a finished plan normally
+    /// continues by itself. This is the one place it must not: the node exists
+    /// precisely because the next step needs a decision, and a wave that ran on
+    /// would take that decision for it.
+    #[test]
+    fn a_confirm_gate_stops_the_automatic_next_wave() {
+        let graph = serde_json::json!({
+            "v": crate::graph::DETAILS_VERSION,
+            "taskId": "T1",
+            "tier": 0,
+            "nodes": [
+                {"id": "a", "task": "decide here", "status": "done", "confirmBeforeNext": true},
+                {"id": "b", "task": "after the decision", "deps": ["a"], "status": "pending"}
+            ]
+        });
+        assert!(
+            crate::next_ready_wave(&graph, 4, &Binding::default(), None, None, 0).is_none(),
+            "the gate did not hold: the next wave was queued anyway"
+        );
+    }
+
+    /// A gate that has not finished yet holds nothing: the wave it is in has to
+    /// run before there is anything to confirm.
+    #[test]
+    fn a_pending_confirm_gate_does_not_block_its_own_wave() {
+        let graph = serde_json::json!({
+            "v": crate::graph::DETAILS_VERSION,
+            "taskId": "T1",
+            "tier": 0,
+            "nodes": [
+                {"id": "a", "task": "decide here", "status": "pending", "confirmBeforeNext": true},
+                {"id": "b", "task": "later", "deps": ["a"], "status": "pending"}
+            ]
+        });
+        let next = crate::next_ready_wave(&graph, 4, &Binding::default(), None, None, 0)
+            .expect("the gate's own wave must still be queued");
+        match next {
+            Effect::Launch { nodes, .. } => assert_eq!(nodes, vec!["a".to_string()]),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// An unmarked plan still runs on by itself: the gate is the exception, not
+    /// the new default.
+    #[test]
+    fn an_unmarked_plan_still_continues_by_itself() {
+        let graph = serde_json::json!({
+            "v": crate::graph::DETAILS_VERSION,
+            "taskId": "T1",
+            "tier": 0,
+            "nodes": [
+                {"id": "a", "task": "first", "status": "done"},
+                {"id": "b", "task": "second", "deps": ["a"], "status": "pending"}
+            ]
+        });
+        assert!(crate::next_ready_wave(&graph, 4, &Binding::default(), None, None, 0).is_some());
+    }
+
     #[test]
     fn a_finished_plan_queues_nothing() {
         // No ready node means no next wave; queueing an empty one would spin.

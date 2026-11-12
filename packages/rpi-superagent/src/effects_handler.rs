@@ -210,9 +210,6 @@ fn run_launch(
             // wave, dispatch has already released that state, and when the daemon
             // runs it the state belongs to a process that never saw the plan. The
             // reply is the one description of the graph that both paths have.
-            if let Ok(cwd) = std::env::current_dir() {
-                let _ = std::fs::write(cwd.join(".rpi/dbg2.txt"), &text);
-            }
             if let Some(current) = details_of(&text) {
                 if let Some(next) =
                     crate::next_ready_wave(

@@ -751,6 +751,7 @@ mod tests {
             status,
             result: None,
             error: None,
+            confirm_before_next: false,
             started_at: 0,
         }
     }

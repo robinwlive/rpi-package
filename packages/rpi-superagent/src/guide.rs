@@ -56,6 +56,16 @@ with other work — that is the whole point of running it in a child process. If
 you would have to wait for the result to take your next step, do that step in
 this session instead of dispatching it.
 
+**A wave finishes on its own.** Once a wave ends, the engine queues the next one
+whenever a node's dependencies are satisfied, so a plan you wrote once runs to
+completion without being asked again — that plan *was* your decision.
+
+The exception is a step that needs a decision **before** the next one starts. Mark
+that node `confirmBeforeNext: true`. When it finishes, no next wave is queued: its
+report comes back, and you decide. Use it at the one point where changing course
+matters, not on every node — a gate on every step turns a plan back into a
+one-step-at-a-time conversation.
+
 **Answering "how many are running, doing what, how far along":**
 
 `superagent_plan(action=show)` answers all three from live state:
