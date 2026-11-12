@@ -318,11 +318,33 @@ pub struct Row {
     pub due: Instant,
     /// The last failure, kept so the row can explain itself.
     pub error: Option<String>,
+    /// The key this row was stored under, when it came from the log.
+    ///
+    /// Rows are namespaced by session now, but a log written before that change
+    /// holds bare task keys. Recomputing `row_key()` for such a row would not
+    /// match the `queued` line it was loaded from, so its `done` line would retire
+    /// nothing and the row would come back on every load — forever. Carrying the
+    /// key it was read under is what lets an old row finish normally.
+    ///
+    /// `None` for a row created in this process: its key is `row_key()`.
+    pub stored_key: Option<String>,
 }
 
 impl Row {
+    /// The key this row is stored under.
+    ///
+    /// The log's key when it came from disk, `row_key()` for a fresh row — so a
+    /// row keeps matching the line that created it even across the session
+    /// namespacing change.
+    pub fn key(&self) -> String {
+        self.stored_key
+            .clone()
+            .unwrap_or_else(|| self.effect.row_key())
+    }
+
     fn new(effect: Effect, seq: u64, now: Instant) -> Self {
         Row {
+            stored_key: None,
             effect,
             seq,
             attempts: 0,
@@ -564,7 +586,7 @@ impl Effects {
                 }
                 if running
                     .iter()
-                    .any(|(k, key)| *k == kind && *key == row.effect.row_key())
+                    .any(|(k, key)| *k == kind && *key == row.key())
                 {
                     continue;
                 }
@@ -577,7 +599,7 @@ impl Effects {
         let mut ran = 0;
         for row in ready {
             let kind = row.effect.kind();
-            let key = row.effect.row_key();
+            let key = row.key();
             self.running
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

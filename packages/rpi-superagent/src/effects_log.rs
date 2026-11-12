@@ -352,6 +352,9 @@ pub fn fold(lines: &[Line]) -> Vec<Row> {
             attempts: line.attempts,
             due: due_instant(line.due_at, now),
             error: line.error.clone(),
+            // The key this row was stored under, so its `done` line matches even
+            // when the key scheme has changed since it was written.
+            stored_key: Some(line.key.clone()),
         });
     }
     out.sort_by_key(|row| row.seq);
@@ -637,6 +640,47 @@ mod tests {
         log.append_state(Kind::Launch, &launch("T1").row_key(), 1, State::Done, None)
             .unwrap();
         assert!(log.load().is_empty());
+    }
+
+    /// A row written before rows were namespaced by session must still retire.
+    ///
+    /// Its `queued` line carries the bare task key. Recomputing the key when the
+    /// row finishes would produce the namespaced form, which matches no line, so
+    /// the `done` line would retire nothing and the row would come back on every
+    /// load — one zombie row per legacy entry, forever.
+    ///
+    /// The line is written by hand because every current writer already emits the
+    /// namespaced key; a test that used one would not exercise the old format.
+    #[test]
+    fn a_row_written_under_the_old_bare_key_still_retires() {
+        let dir = scratch("legacy-key");
+        let path = log_path(&dir, "s1");
+        let legacy = serde_json::json!({
+            "v": VERSION,
+            "kind": "launch",
+            "key": "T1#0",
+            "state": "queued",
+            "seq": 1,
+            "attempts": 0,
+            "due_at": now_ms(),
+            "payload": {"type": "launch", "task_id": "T1", "nodes": ["a"],
+                        "max_parallel": 1, "wave": 0},
+            "error": null,
+            "session": "sess-1"
+        });
+        std::fs::write(&path, format!("{legacy}\n")).unwrap();
+
+        let mut log = Log::open(&dir, "s1").unwrap();
+        let rows = log.load();
+        assert_eq!(rows.len(), 1, "the legacy row did not load");
+        let row_key = rows[0].key();
+
+        log.append_state(Kind::Launch, &row_key, 1, State::Done, None)
+            .unwrap();
+        assert!(
+            Log::open(&dir, "s1").unwrap().load().is_empty(),
+            "a legacy row could not retire: it will come back on every load"
+        );
     }
 
     #[test]

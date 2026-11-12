@@ -613,6 +613,43 @@ mod tests {
 
     /// A gate that has not finished yet holds nothing: the wave it is in has to
     /// run before there is anything to confirm.
+    /// A finished gate holds its own continuation, and only once.
+    ///
+    /// `dispatch` clears the flag on the wave that finishes the node, so the hold
+    /// applies to the continuation of that wave and not to every wave after it.
+    /// Keying the check on "a finished gate exists anywhere" would stop the plan
+    /// permanently one wave short of done, and nothing would report it.
+    #[test]
+    fn a_finished_gate_holds_once_then_releases() {
+        let gated = serde_json::json!({
+            "v": crate::graph::DETAILS_VERSION,
+            "taskId": "T1",
+            "tier": 0,
+            "nodes": [
+                {"id": "gate", "task": "decide", "status": "done", "confirmBeforeNext": true},
+                {"id": "b", "task": "then this", "deps": ["gate"], "status": "pending"}
+            ]
+        });
+        assert!(
+            crate::next_ready_wave(&gated, 4, &Binding::default(), None, None, 1).is_none(),
+            "the gate did not hold its own continuation"
+        );
+        // What `dispatch` writes once the gate node's wave has finished.
+        let consumed = serde_json::json!({
+            "v": crate::graph::DETAILS_VERSION,
+            "taskId": "T1",
+            "tier": 0,
+            "nodes": [
+                {"id": "gate", "task": "decide", "status": "done", "confirmBeforeNext": false},
+                {"id": "b", "task": "then this", "deps": ["gate"], "status": "pending"}
+            ]
+        });
+        assert!(
+            crate::next_ready_wave(&consumed, 4, &Binding::default(), None, None, 1).is_some(),
+            "the plan stopped one wave short: the gate kept holding after it was consumed"
+        );
+    }
+
     #[test]
     fn a_pending_confirm_gate_does_not_block_its_own_wave() {
         let graph = serde_json::json!({

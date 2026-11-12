@@ -112,14 +112,17 @@ pub(crate) fn next_ready_wave(
     // both the in-process scheduler and the daemon come through this function,
     // and a gate only one of them honoured would be a gate that leaks.
     //
-    // Only a *finished* gate holds: the same plan is dispatched again on purpose
-    // when the model has decided, and by then that node is still `done` — so the
-    // hold is on the automatic continuation, not on an explicit dispatch.
-    if let Some(gate) = rebuilt.nodes.iter().find(|node| {
+    // The gate holds for **the wave after its own**, not for every wave after it.
+    // `wave` counts the continuations of one task, so a finished gate whose own
+    // wave was the previous one blocks wave `n+1` and nothing else. Keying it on
+    // "is there a finished gate anywhere" instead would stop the plan one wave
+    // short of done, permanently: the gate node stays `done` forever, so every
+    // later continuation would also be refused and nobody would notice until the
+    // work quietly never finished.
+    if rebuilt.nodes.iter().any(|node| {
         node.confirm_before_next
             && matches!(node.status, graph::Status::Done | graph::Status::Failed)
     }) {
-        let _ = gate;
         return None;
     }
     let ready = rebuilt.ready();
@@ -695,6 +698,103 @@ mod tests {
         assert_eq!(
             state.graph().get("x").unwrap().status,
             graph::Status::Pending
+        );
+    }
+
+    /// An edit during a running wave used to leave its nodes `running` forever.
+    ///
+    /// `dispatch` marks the ready set `running`, then edits the plan, and the
+    /// generation check refuses the wave's results ("stale results discarded").
+    /// The refusal returns **before** the nodes are written back, so they keep the
+    /// `running` mark with no child behind them. `queue_wave` refuses to dispatch
+    /// while any node is `running`, so that session could never dispatch again.
+    ///
+    /// Editing during a wave is the whole point of steering live work, so this is
+    /// the common path, not an edge case.
+    #[test]
+    fn editing_during_a_wave_leaves_nothing_stuck_running() {
+        let _serial = graph_test_guard();
+        let params = params_for(Some("stuck-running"));
+        let control = crate::control::Control::default();
+        let progress = std::sync::mpsc::channel().0;
+        let mut set = params.clone();
+        set["action"] = serde_json::json!("set");
+        set["nodes"] = serde_json::json!([{"id": "a", "task": "slow"}]);
+        crate::plan::plan(&set, &control, &progress).unwrap();
+
+        let edit = params.clone();
+        let fixture = move |_: &graph::Graph,
+                            ready: &[String],
+                            _: usize,
+                            _: &crate::control::Control,
+                            _: &crate::kit::Progress,
+                            _: &crate::host::Selection,
+                            _: &std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+                            _: &str,
+                            _: Option<&str>| {
+            // The person changes their mind while this wave is still running.
+            let mut update = edit.clone();
+            update["action"] = serde_json::json!("update");
+            update["addNodes"] = serde_json::json!([{"id": "z", "task": "new work"}]);
+            crate::plan::plan(&update, &crate::control::Control::default(), &std::sync::mpsc::channel().0)
+                .expect("the edit must be accepted during a wave");
+            ready
+                .iter()
+                .map(|id| (id.clone(), Ok("too late".into())))
+                .collect::<Vec<(String, Result<String, String>)>>()
+        };
+        // The stale-results error is expected; what matters is the graph after it.
+        let _ = crate::dispatch::dispatch_with(&params, &control, &progress, fixture);
+
+        let state = lock_graph(&params);
+        let node = state.graph().get("a").unwrap();
+        assert_ne!(
+            node.status,
+            graph::Status::Running,
+            "the stale wave left its node running with no child behind it"
+        );
+    }
+
+    /// The gate flag is cleared by the wave that finishes the node.
+    ///
+    /// This is what keeps a gated plan from stopping one wave short of done: the
+    /// flag is a brake, not a record, and a brake left on is a stuck plan.
+    #[test]
+    fn a_finished_gate_is_cleared_so_the_plan_can_continue() {
+        let _serial = graph_test_guard();
+        let params = params_for(Some("gate-consumed"));
+        let control = crate::control::Control::default();
+        let progress = std::sync::mpsc::channel().0;
+        let mut set = params.clone();
+        set["action"] = serde_json::json!("set");
+        set["nodes"] = serde_json::json!([
+            {"id": "gate", "task": "decide", "confirmBeforeNext": true},
+            {"id": "b", "task": "then this", "deps": ["gate"]}
+        ]);
+        crate::plan::plan(&set, &control, &progress).unwrap();
+
+        let fixture = |_: &graph::Graph,
+                       ready: &[String],
+                       _: usize,
+                       _: &crate::control::Control,
+                       _: &crate::kit::Progress,
+                       _: &crate::host::Selection,
+                       _: &std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+                       _: &str,
+                       _: Option<&str>| {
+            ready
+                .iter()
+                .map(|id| (id.clone(), Ok("ok".into())))
+                .collect::<Vec<(String, Result<String, String>)>>()
+        };
+        crate::dispatch::dispatch_with(&params, &control, &progress, fixture).unwrap();
+
+        let state = lock_graph(&params);
+        let gate = state.graph().get("gate").unwrap();
+        assert_eq!(gate.status, graph::Status::Done);
+        assert!(
+            !gate.confirm_before_next,
+            "the gate stayed on, so every later wave will be refused"
         );
     }
 

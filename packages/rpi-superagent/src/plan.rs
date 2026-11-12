@@ -114,13 +114,31 @@ fn apply_update(graph: &mut Graph, params: &Value) -> Result<(), String> {
     }
     if let Some(remove) = params.get("removeIds") {
         let array = remove.as_array().ok_or("`removeIds` must be an array")?;
+        let mut removed: Vec<String> = Vec::with_capacity(array.len());
         for item in array {
             let id = item
                 .as_str()
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .ok_or("`removeIds` must contain non-empty strings")?;
-            graph.nodes.retain(|node| node.id != id);
+            removed.push(id.to_string());
+        }
+        graph.nodes.retain(|node| !removed.contains(&node.id));
+        // Drop the edges pointing at them.
+        //
+        // Without this, `validate()` rejects the whole update for "unknown dep",
+        // so the *good* half of the same update — the replacement node — is
+        // discarded too. Replacing a task is one update ("drop the old, here is
+        // the new"), and it failing because a dependent still named the old node
+        // would force the caller to remove the edges by hand first: exactly the
+        // cleanup-before-you-can-act cost this tool exists to remove.
+        //
+        // The dependent keeps running; it simply no longer waits for a node that
+        // does not exist.
+        if !removed.is_empty() {
+            for node in &mut graph.nodes {
+                node.deps.retain(|dep| !removed.contains(dep));
+            }
         }
     }
     if let Some(set_deps) = params.get("setDeps") {
@@ -352,12 +370,113 @@ mod tests {
         assert_eq!(g.get("b").unwrap().status, Status::Skipped);
     }
 
+    /// Cancelling a node must not touch work that already finished.
+    ///
+    /// `propagate_skips` walks dependents, and a dependent that is `done` has a
+    /// result the person may already have read. Overwriting it with `skipped`
+    /// would erase finished work because unrelated work was cancelled.
+    #[test]
+    fn cancel_does_not_erase_an_already_finished_dependent() {
+        let mut g = seeded();
+        g.get_mut("a").unwrap().status = Status::Running;
+        g.get_mut("b").unwrap().status = Status::Done;
+        g.get_mut("b").unwrap().result = Some("finished work".into());
+        apply_update(&mut g, &json!({"cancel": ["a"]})).unwrap();
+        let b = g.get("b").unwrap();
+        assert_eq!(b.status, Status::Done, "finished work was skipped");
+        assert_eq!(b.result.as_deref(), Some("finished work"));
+    }
+
+    /// A replacement task must be able to take over from a cancelled one.
+    ///
+    /// The live scenario: `a` is obsolete, so the person cancels it and adds
+    /// `a2` with the updated instructions, while `b` — still waiting — should now
+    /// depend on `a2`. If the new node cannot be wired up in the same update, the
+    /// person is back to cleaning up by hand before they can act.
+    /// Dropping the dangling edge must not eat edges written in the same update.
+    ///
+    /// `removeIds` runs before `setDeps`, so the cleanup only clears edges that
+    /// still point at a removed id. An edge the same update deliberately sets to a
+    /// surviving node must be untouched — otherwise the fix for one problem
+    /// silently breaks the other half of the same edit.
+    #[test]
+    fn removing_a_node_keeps_deps_set_to_surviving_nodes() {
+        let mut g = seeded();
+        apply_update(
+            &mut g,
+            &json!({
+                "removeIds": ["a"],
+                "addNodes": [{"id": "a2", "task": "replacement"}],
+                "setDeps": [{"id": "b", "deps": ["a2"]}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            g.get("b").unwrap().deps,
+            vec!["a2".to_string()],
+            "the update's own setDeps was cleared by the removeIds cleanup"
+        );
+    }
+
+    #[test]
+    fn a_replacement_node_can_take_over_from_a_cancelled_one() {
+        let mut g = seeded();
+        g.get_mut("a").unwrap().status = Status::Running;
+        apply_update(
+            &mut g,
+            &json!({
+                "cancel": ["a"],
+                "addNodes": [{"id": "a2", "task": "the updated version"}],
+                "setDeps": [{"id": "b", "deps": ["a2"]}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(g.get("a").unwrap().status, Status::Skipped);
+        // `b` was skipped when `a` was cancelled, so it has to be re-armed to run
+        // against the replacement.
+        apply_update(&mut g, &json!({"reset": ["b"]})).unwrap();
+        assert_eq!(g.get("b").unwrap().status, Status::Pending);
+        assert_eq!(g.get("b").unwrap().deps, vec!["a2".to_string()]);
+        // The replacement is what runs next.
+        assert_eq!(g.ready(), vec!["a2".to_string()]);
+    }
+
     #[test]
     fn cancel_rejects_an_unknown_node() {
         let mut g = seeded();
         assert!(apply_update(&mut g, &json!({"cancel": ["ghost"]}))
             .unwrap_err()
             .contains("not found"));
+    }
+
+    /// Removing a node that others depend on must not dead-end the edit.
+    ///
+    /// A person replacing a task says "drop the old one, here is the new one" in a
+    /// single update. The dependents' edges to the removed node would fail
+    /// `validate()` ("unknown dep"), and because validation runs on the whole
+    /// graph the *good* half of the edit — the new node — is thrown away too. The
+    /// person then has to discover and name every dependent edge to get anything
+    /// done, which is exactly the "wait, let me clean up first" cost this feature
+    /// exists to remove.
+    #[test]
+    fn removing_a_node_that_others_depend_on_does_not_fail_the_edit() {
+        let mut g = seeded();
+        // `b` depends on `a`; drop `a` and add its replacement.
+        assert!(
+            apply_update(
+                &mut g,
+                &json!({"removeIds": ["a"], "addNodes": [{"id": "a2", "task": "replacement"}]})
+            )
+            .is_ok(),
+            "replacing a node that has dependents was rejected"
+        );
+        assert!(g.validate().is_ok(), "the edited graph is not valid");
+        // The dependent survives, without a dangling edge to the removed node.
+        assert!(g.get("b").is_some());
+        assert!(
+            !g.get("b").unwrap().deps.iter().any(|d| d == "a"),
+            "b still points at the removed node"
+        );
     }
 
     #[test]

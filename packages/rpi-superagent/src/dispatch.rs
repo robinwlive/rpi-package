@@ -326,7 +326,36 @@ pub(super) fn dispatch_with(
         stop.store(true, Ordering::Release);
         let _ = handle.join();
     }
-    drop(wave?);
+    match wave {
+        Ok(guard) => drop(guard),
+        Err(message) => {
+            // The plan was edited while this wave ran, so these results describe a
+            // graph that no longer exists. Refusing them is right. Leaving the
+            // nodes marked `running` is not: those children have exited, and
+            // `queue_wave` refuses to dispatch while any node is `running`, so the
+            // session would never dispatch again.
+            //
+            // Only nodes still marked `running` are cleared. An edit may already
+            // have set one to `skipped` (cancelled) or removed it entirely, and
+            // overwriting that would undo the person's decision.
+            let mut current = lock_graph(params);
+            let graph = current.graph_mut();
+            for id in &ready {
+                if let Some(node) = graph.get_mut(id) {
+                    if node.status == Status::Running {
+                        node.status = Status::Pending;
+                        node.started_at = 0;
+                    }
+                }
+            }
+            // Deliberately an error, not a quiet continuation. This wave's nodes
+            // were reset to `pending`, so a continuation built from them would run
+            // the same work again under the edited plan without anyone re-reading
+            // it. The model is told the results were discarded, and it decides what
+            // to dispatch next — which is the whole point of editing mid-wave.
+            return Err(message);
+        }
+    }
     let outcomes: Vec<_> = outcomes
         .into_iter()
         .map(|(id, outcome)| {
@@ -390,6 +419,24 @@ pub(super) fn dispatch_with(
         }
     }
     graph.propagate_skips();
+
+    // A gate is consumed by the wave that finishes it.
+    //
+    // The gate exists so the model decides before the *next* wave. Leaving the
+    // flag set on a finished node would make every later continuation refuse, so
+    // the plan would stop permanently one wave short of done — and nothing would
+    // report it. Clearing it here means the hold applies exactly once, to the
+    // continuation of the wave that finished it.
+    //
+    // The report still names the node and its result, so the model knows what it
+    // was asked to decide about; the flag was never the record, only the brake.
+    for node in &mut graph.nodes {
+        if node.confirm_before_next
+            && matches!(node.status, Status::Done | Status::Failed)
+        {
+            node.confirm_before_next = false;
+        }
+    }
 
     // One record per node, written to the **parent** session (docs/15 §3).
     //
