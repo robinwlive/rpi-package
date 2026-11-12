@@ -3,7 +3,7 @@
   "properties": {
     "action": {"type":"string","enum":["create","list"],"default":"create","description":"create writes a score and requires name/value/traceId even when action is omitted; list reads one Scores API v3 response page."},
     "name": {"type":"string","description":"Required for create: score metric name. Ignored by list (not a name filter)."},
-    "value": {"type":["number","string","object"],"description":"Required for create: score value forwarded unchanged; acceptable shape/type depends on the Langfuse API. Ignored by list."},
+    "value": {"description":"Required for create: score value forwarded unchanged as any JSON value (number, string or object); acceptable shape depends on the Langfuse API. Ignored by list. No JSON-Schema type is declared because strict OpenAI-schema validators reject union type arrays."},
     "traceId": {"type":"string","description":"Required for create: target trace ID. Ignored by list (not a trace filter)."},
     "observationId": {"type":"string","description":"Optional create-only observation ID within the target trace; omitted when absent."},
     "comment": {"type":"string","description":"Optional create-only score comment, persisted remotely. Do not include secrets."},
