@@ -219,9 +219,14 @@ pub fn serve_log(path: &Path) -> usize {
                 // Retire the row. A write that fails here is reported, not
                 // swallowed: the work is done but the log would say otherwise, and
                 // the next tick would do it again.
+                // `row.key()`, not a recomputed `row_key()`: a row loaded from a
+                // log written before rows were namespaced by session carries a
+                // bare key, and the namespaced form matches no line — the `done`
+                // line would retire nothing and the daemon would run the same
+                // effect on every tick, forever.
                 if let Err(error) = log.append_state(
                     row.effect.kind(),
-                    &row.effect.row_key(),
+                    &row.key(),
                     row.seq,
                     crate::effects_log::State::Done,
                     None,
@@ -257,9 +262,12 @@ pub fn serve_log(path: &Path) -> usize {
                         row.effect.kind().as_str(),
                         row.effect.key()
                     );
+                    // Same reason as the success path above: the key must be the
+                    // one this row was read under, or the row is never retired and
+                    // a hopeless effect keeps being re-read on every tick.
                     let _ = log.append_state(
                         row.effect.kind(),
-                        &row.effect.row_key(),
+                        &row.key(),
                         row.seq,
                         crate::effects_log::State::Done,
                         Some(&message),
@@ -521,6 +529,51 @@ mod tests {
         }
         let path = crate::effects_log::log_path(&root, owner);
         assert_eq!(serve_log(&path), 1, "the queue still runs");
+    }
+
+    /// A legacy row (bare key, written before session namespacing) must still be
+    /// retired by the daemon.
+    ///
+    /// The daemon recomputed the row key when writing the `done` line, so a row
+    /// loaded under an older key matched no line and stayed queued: the daemon
+    /// re-ran the same effect on every 2s tick, forever, even though the work had
+    /// finished. Nothing surfaced it — the effect kept "succeeding".
+    #[test]
+    fn a_legacy_row_is_retired_by_the_daemon() {
+        let root = scratch("legacy-retire");
+        let owner = "s3";
+        let path = crate::effects_log::log_path(&root, owner);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A `launch` row carrying a session: `row_key()` prefixes a session, so
+        // recomputing yields `sess-A/T1#0` while the stored line says `T1#0`. A
+        // row with no session keys the same either way and would not exercise
+        // the mismatch at all.
+        //
+        // `Extend` is the handler used instead of `Launch`: it always fails
+        // without a session, and the row is already past the attempt cap, so it is
+        // retired through the give-up path with no child process.
+        let legacy = serde_json::json!({
+            "v": crate::effects_log::VERSION,
+            "kind": "extend",
+            "key": "T1",
+            "state": "queued",
+            "seq": 1,
+            "attempts": MAX_ATTEMPTS,
+            "due_at": adoptable(),
+            "payload": {"type": "extend", "task_id": "T1",
+                        "node": {"id": "a", "task": "x"}},
+            "error": Some("always fails"),
+            "session": "sess-A"
+        });
+        std::fs::write(&path, format!("{legacy}\n")).unwrap();
+
+        serve_log(&path);
+
+        let log = crate::effects_log::Log::open(&root, owner).unwrap();
+        assert!(
+            log.load().is_empty(),
+            "a legacy row was not retired: the daemon will re-run it forever"
+        );
     }
 
     #[test]

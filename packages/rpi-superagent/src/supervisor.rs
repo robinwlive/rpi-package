@@ -182,8 +182,16 @@ fn recorded_pids() -> Vec<(Vec<u32>, Option<u32>)> {
 
 /// The same, over a given set of files.
 fn recorded_pids_from(files: &[PathBuf]) -> Vec<(Vec<u32>, Option<u32>)> {
-    let mut by_task: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
-    let mut owners: std::collections::HashMap<String, Option<u32>> =
+    // Keyed by **file and task**, not by task id alone.
+    //
+    // A task id is chosen by the model inside one session, so two sessions
+    // commonly both call theirs `T1`. Keying on the id merged them: one session's
+    // child pids ended up under the other session's owner, and when that owner was
+    // dead the sweep killed a child that was running in a live session. The file
+    // is what identifies "this task, in this session".
+    let mut by_task: std::collections::HashMap<(PathBuf, String), Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut owners: std::collections::HashMap<(PathBuf, String), Option<u32>> =
         std::collections::HashMap::new();
     for file in files.iter() {
         // Two cheap checks before reading anything: a file that has not been
@@ -216,8 +224,9 @@ fn recorded_pids_from(files: &[PathBuf]) -> Vec<(Vec<u32>, Option<u32>)> {
             let Some(task_id) = data.get("taskId").and_then(Value::as_str) else {
                 continue;
             };
+            let key = (file.clone(), task_id.to_string());
             by_task.insert(
-                task_id.to_string(),
+                key.clone(),
                 data.get("pids")
                     .and_then(Value::as_array)
                     .map(|pids| {
@@ -229,15 +238,15 @@ fn recorded_pids_from(files: &[PathBuf]) -> Vec<(Vec<u32>, Option<u32>)> {
                     .unwrap_or_default(),
             );
             owners.insert(
-                task_id.to_string(),
+                key,
                 data.get("ownerPid").and_then(Value::as_u64).map(|pid| pid as u32),
             );
         }
     }
     by_task
         .into_iter()
-        .map(|(task_id, pids)| {
-            let owner = owners.get(&task_id).copied().flatten();
+        .map(|(key, pids)| {
+            let owner = owners.get(&key).copied().flatten();
             (pids, owner)
         })
         .collect()
@@ -551,6 +560,56 @@ mod tests {
         assert_eq!(recorded[0].1, Some(owner), "the owner must be recorded");
         std::fs::remove_file(&file).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two sessions that both named their task `T1` must not be merged.
+    ///
+    /// Snapshots are collected across every session file, keyed by task id alone.
+    /// Task ids are chosen by the model in each session, so two main sessions
+    /// commonly both call a task `T1`. Merging them puts one session's child pids
+    /// under the other session's owner — and when that owner is dead, the sweep
+    /// kills a child that is running right now in a live session.
+    #[test]
+    fn two_sessions_sharing_a_task_id_are_not_merged() {
+        let dir = std::env::temp_dir().join(format!("rpi-superagent-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.jsonl");
+        let dead = dir.join("dead.jsonl");
+        // A live session's own child.
+        std::fs::write(
+            &live,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "customType": "superagent-task",
+                    "data": {"taskId": "T1", "pids": [1111], "ownerPid": 1111}
+                })
+            ),
+        )
+        .unwrap();
+        // Another session's task, same id, whose owner is gone.
+        std::fs::write(
+            &dead,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "customType": "superagent-task",
+                    "data": {"taskId": "T1", "pids": [2222], "ownerPid": 999999}
+                })
+            ),
+        )
+        .unwrap();
+
+        let recorded = recorded_pids_from(&[live.clone(), dead.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Each session's child must stay attached to its own owner. One merged
+        // entry means a live child can inherit a dead owner and be swept.
+        assert_eq!(
+            recorded.len(),
+            2,
+            "two sessions' tasks were merged by task id alone: {recorded:?}"
+        );
     }
 
     /// A snapshot without an owner is treated as an orphan: an unknown owner
