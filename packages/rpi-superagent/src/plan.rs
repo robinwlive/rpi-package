@@ -34,11 +34,19 @@ pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<S
         .and_then(Value::as_str)
         .unwrap_or("show");
     let mut guard = lock_graph(params);
-    if matches!(action, "set" | "update") && guard.is_running() {
-        return Err(
-            "dispatch is running: wait for the wave to finish before editing the plan".into(),
-        );
-    }
+    // The plan is editable while a wave runs.
+    //
+    // It used to be refused ("wait for the wave to finish"), which quietly
+    // assumed a job is written once and then executed. Real work is not like
+    // that: a step becomes pointless, or a better version of it arrives, while
+    // the other workers are still busy. Forbidding the edit at exactly that
+    // moment forced the caller to wait for unrelated work to finish before it
+    // could cancel something already known to be wasted.
+    //
+    // What the wave is doing is unaffected: `dispatch` snapshots the graph and
+    // hands the snapshot to the children, and results are applied only if the
+    // generation still matches. An edit bumps the generation, so the running
+    // wave's results are discarded rather than written onto the new plan.
     let graph = guard.graph_mut();
     match action {
         "set" => {
@@ -162,9 +170,51 @@ fn apply_update(graph: &mut Graph, params: &Value) -> Result<(), String> {
             // A re-armed node has not failed yet: a stale reason would make a
             // pending node look like it already failed.
             node.error = None;
+            // It is about to be run again (or has just been cancelled), so the
+            // old start time no longer describes it.
+            node.started_at = 0;
         }
     }
+    if let Some(cancel) = params.get("cancel") {
+        // Drop work that is no longer wanted.
+        //
+        // This is not `reset`. A node that is `running` has a live child; marking
+        // it `pending` would leave that child working with nobody waiting for it,
+        // and the next wave would start a second copy of the same job. `cancel`
+        // says `skipped` instead: nobody wants this result any more.
+        //
+        // Its dependents become skipped too — `propagate_skips` does that below,
+        // because a node that needed the cancelled result cannot proceed either.
+        for id in node_ids(params, "cancel")? {
+            let node = graph
+                .get_mut(&id)
+                .ok_or_else(|| format!("node `{id}` not found"))?;
+            node.status = Status::Skipped;
+            node.result = None;
+            node.error = None;
+            node.started_at = 0;
+        }
+        graph.propagate_skips();
+    }
     Ok(())
+}
+
+/// A list of node ids from one array parameter, trimmed and non-empty.
+fn node_ids(params: &Value, name: &str) -> Result<Vec<String>, String> {
+    let array = params
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("`{name}` must be an array"))?;
+    array
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| format!("`{name}` must contain non-empty strings"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -260,6 +310,54 @@ mod tests {
         let mut g = seeded();
         apply_update(&mut g, &json!({"status": [{"id": "a", "status": "done"}]})).unwrap();
         assert_eq!(g.get("a").unwrap().status, Status::Pending);
+    }
+
+    /// A node whose work became pointless can be dropped while other workers
+    /// keep going. This is the case the package exists for: the plan is not
+    /// written once and executed, it is steered.
+    #[test]
+    fn cancel_skips_a_running_node_and_its_dependents() {
+        let mut g = seeded();
+        g.get_mut("a").unwrap().status = Status::Running;
+        g.get_mut("a").unwrap().started_at = 12345;
+        // `b` depends on the cancelled node, so it cannot proceed either.
+        apply_update(&mut g, &json!({"cancel": ["a"]})).unwrap();
+        assert_eq!(g.get("a").unwrap().status, Status::Skipped);
+        assert_eq!(g.get("a").unwrap().started_at, 0);
+        assert_eq!(g.get("b").unwrap().status, Status::Skipped);
+    }
+
+    /// `cancel` must not re-arm: marking a live node pending would leave its
+    /// child running for nobody and start a second copy on the next wave.
+    #[test]
+    fn cancel_does_not_rearm_a_node_the_way_reset_does() {
+        let mut g = seeded();
+        g.get_mut("a").unwrap().status = Status::Running;
+        apply_update(&mut g, &json!({"cancel": ["a"]})).unwrap();
+        assert_ne!(
+            g.get("a").unwrap().status,
+            Status::Pending,
+            "cancel re-armed the node instead of dropping it"
+        );
+    }
+
+    /// Cancelling one node leaves its siblings alone.
+    #[test]
+    fn cancel_leaves_unrelated_nodes_running() {
+        let mut g = seeded();
+        g.get_mut("a").unwrap().status = Status::Running;
+        g.get_mut("b").unwrap().status = Status::Running;
+        apply_update(&mut g, &json!({"cancel": ["b"]})).unwrap();
+        assert_eq!(g.get("a").unwrap().status, Status::Running);
+        assert_eq!(g.get("b").unwrap().status, Status::Skipped);
+    }
+
+    #[test]
+    fn cancel_rejects_an_unknown_node() {
+        let mut g = seeded();
+        assert!(apply_update(&mut g, &json!({"cancel": ["ghost"]}))
+            .unwrap_err()
+            .contains("not found"));
     }
 
     #[test]

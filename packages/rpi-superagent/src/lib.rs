@@ -679,8 +679,16 @@ mod tests {
             "plan show blocked during verification: {readable:?}"
         );
         let (editing, result, replacement) = replacement.unwrap();
-        assert!(editing.unwrap_err().contains("dispatch is running"));
+        // Editing during a wave is allowed now: a step can become pointless while
+        // other workers are still busy, and making the caller wait for unrelated
+        // work before it could cancel that step was the bug.
+        assert!(
+            editing.is_ok(),
+            "an edit during a running wave must be accepted: {editing:?}"
+        );
         result.unwrap();
+        // The running wave's results are still refused — the edit bumped the
+        // generation, so what the old wave produced no longer describes this plan.
         assert!(wave_result.unwrap_err().contains("stale results discarded"));
         let state = lock_graph(&replacement);
         assert_eq!(state.graph().get("x").unwrap().task, "replacement");
@@ -739,34 +747,37 @@ mod tests {
             guard.generation()
         };
 
+        // Queueing a second wave while one runs is still refused: that would run
+        // nodes the first wave already marked running.
+        assert!(crate::dispatch::dispatch(&params, &control, &progress)
+            .unwrap_err()
+            .contains("already running"));
+
+        // Editing the plan, however, is allowed — that is how a node gets
+        // cancelled or replaced while the other workers are still busy.
         let mut update = params.clone();
         update["action"] = serde_json::json!("update");
         update["reset"] = serde_json::json!(["x"]);
         for edit in [&set, &update] {
-            assert!(crate::plan::plan(edit, &control, &progress)
-                .unwrap_err()
-                .contains("dispatch is running"));
-        }
-        assert!(crate::dispatch::dispatch(&params, &control, &progress)
-            .unwrap_err()
-            .contains("already running"));
-        assert!(crate::plan::plan(&params, &control, &progress)
-            .unwrap()
-            .contains("original"));
-        {
-            let mut guard = lock_graph_for_wave(&params, generation).unwrap();
-            assert_eq!(
-                guard.graph().get("x").unwrap().status,
-                graph::Status::Running
+            assert!(
+                crate::plan::plan(edit, &control, &progress).is_ok(),
+                "an edit during a running wave must be accepted"
             );
-            guard.graph_mut().get_mut("x").unwrap().status = graph::Status::Done;
         }
-        crate::plan::plan(&update, &control, &progress).unwrap();
-        assert_eq!(
-            lock_graph(&params).graph().get("x").unwrap().status,
-            graph::Status::Pending
+        // The edit landed, and it is what makes the running wave stale.
+        //
+        // That is the contract: the wave keeps working on the snapshot it was
+        // given, but its results may not be written onto a plan a person has
+        // since changed. Refusing the results (not the edit) is the correct trade
+        // — the alternative was making the person wait for unrelated workers
+        // before they could cancel work they already knew was wasted.
+        assert!(
+            lock_graph_for_wave(&params, generation).is_err(),
+            "the edit did not invalidate the running wave"
         );
-        assert!(lock_graph_for_wave(&params, generation).is_err());
+        let state = lock_graph(&params);
+        assert_eq!(state.graph().get("x").unwrap().status, graph::Status::Pending);
+        assert_eq!(state.graph().get("x").unwrap().task, "original");
     }
 
     #[test]

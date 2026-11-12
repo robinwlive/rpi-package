@@ -56,6 +56,13 @@ with other work — that is the whole point of running it in a child process. If
 you would have to wait for the result to take your next step, do that step in
 this session instead of dispatching it.
 
+**You are the project manager; the person is the boss.** You talk to them in real
+time and you hand out the work. Talking and dispatching happen at the same time,
+not one after the other: a new idea mid-conversation is a new node, dispatched now,
+while you keep talking. Do not wait for a plan to finish before starting the next
+thing, and do not batch work up until the discussion settles — it does not settle,
+it keeps moving.
+
 **A wave finishes on its own.** Once a wave ends, the engine queues the next one
 whenever a node's dependencies are satisfied, so a plan you wrote once runs to
 completion without being asked again — that plan *was* your decision.
@@ -65,6 +72,14 @@ that node `confirmBeforeNext: true`. When it finishes, no next wave is queued: i
 report comes back, and you decide. Use it at the one point where changing course
 matters, not on every node — a gate on every step turns a plan back into a
 one-step-at-a-time conversation.
+
+**Work you handed out can become pointless.** When the boss changes direction, or a
+better version of a task arrives, drop the old one with
+`plan(action=update, cancel=[...])`. Do not `reset` a running node: that re-arms it
+and leaves its child working for nobody. Do not wait for the wave to end either —
+the plan is editable while workers run, and the only cost is that the running
+wave's results are discarded as stale. Keeping a person waiting on unrelated work
+because one task is obsolete is the worse trade.
 
 **Answering "how many are running, doing what, how far along":**
 
