@@ -632,7 +632,9 @@ mod tests {
         let mut log = Log::open(&dir, "s1").unwrap();
         log.append_queued(&launch("T1"), 1, None, 0, now_ms(), None)
             .unwrap();
-        log.append_state(Kind::Launch, "T1#0", 1, State::Done, None)
+        // The key must be the row key the `queued` line used, not a bare task id:
+        // rows are namespaced by the session that queued them.
+        log.append_state(Kind::Launch, &launch("T1").row_key(), 1, State::Done, None)
             .unwrap();
         assert!(log.load().is_empty());
     }
@@ -643,8 +645,14 @@ mod tests {
         let mut log = Log::open(&dir, "s1").unwrap();
         log.append_queued(&launch("T1"), 1, None, 0, now_ms(), None)
             .unwrap();
-        log.append_state(Kind::Launch, "T1#0", 1, State::Cancelled, None)
-            .unwrap();
+        log.append_state(
+            Kind::Launch,
+            &launch("T1").row_key(),
+            1,
+            State::Cancelled,
+            None,
+        )
+        .unwrap();
         assert!(log.load().is_empty());
     }
 

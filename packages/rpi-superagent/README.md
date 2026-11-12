@@ -44,6 +44,18 @@ kernel plus a small layer that keeps a task alive across restarts.
 改计划会让**正在跑的那一波的结果作废**（用代次校验），但**不会打断已经在跑的员工**：
 它们是照着派活时的快照在干的。结果作废比让老板干等一堆无关的活要划算。
 
+### 多个主会话并存
+
+Dash 里的每个主会话是一个独立的 rpi 进程，各自管自己的员工，互不干扰。但有一处**共享**：
+它们用同一个 `RPI_CODING_AGENT_DIR`，因此共用同一个 effect 队列文件。
+
+队列按「会话 id + task id + wave」去重，所以两个会话都用 `T1` 也不会互相覆盖。
+（早期版本只按 task id 去重，后一个会话的派活会**顶掉**前一个 —— 那个会话的活永远
+不会跑，而它的任务还显示 `working`。）
+
+计划本身是按会话隔离的：切到另一个会话看不到这边的图。所以隔离独立项目，
+**开一个独立主会话就够了**，不必靠 task id 前缀避让。
+
 > **Goal** — 把「一个长任务」从「人盯着它跑」变成「人只在需要裁决时才出现」。
 > (*Turn "a long job" from "you watch it run" into "you show up only when a
 > decision is needed."*)

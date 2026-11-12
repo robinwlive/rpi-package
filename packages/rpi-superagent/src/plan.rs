@@ -175,7 +175,7 @@ fn apply_update(graph: &mut Graph, params: &Value) -> Result<(), String> {
             node.started_at = 0;
         }
     }
-    if let Some(cancel) = params.get("cancel") {
+    if params.get("cancel").is_some() {
         // Drop work that is no longer wanted.
         //
         // This is not `reset`. A node that is `running` has a live child; marking

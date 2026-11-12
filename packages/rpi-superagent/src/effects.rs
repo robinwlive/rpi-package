@@ -214,9 +214,33 @@ impl Effect {
     /// `key()` stays the human-facing subject (a task id, which is what a caller
     /// names); this is what decides coalescing.
     pub fn row_key(&self) -> String {
+        // Namespaced by the session that queued it.
+        //
+        // All main sessions of a project share one queue (they share
+        // `RPI_CODING_AGENT_DIR`, and the queue file is keyed by that). Task ids,
+        // however, are chosen by the model in each session, so two sessions can
+        // both call their task `T1` — and a row keyed by task id alone made the
+        // second launch **replace** the first. That session's work then never
+        // ran, while its task still read `working`.
+        //
+        // The session is the right scope: it is what makes two `T1`s different
+        // jobs rather than one job submitted twice. A row with no session (a
+        // legacy row, or a one-shot run) keeps the old bare key.
+        let scope = self.session().map(|id| format!("{id}/")).unwrap_or_default();
         match self {
-            Effect::Launch { task_id, wave, .. } => format!("{task_id}#{wave}"),
-            other => other.key().to_string(),
+            Effect::Launch { task_id, wave, .. } => format!("{scope}{task_id}#{wave}"),
+            other => format!("{scope}{}", other.key()),
+        }
+    }
+
+    /// The session that queued this effect, when it names one.
+    fn session(&self) -> Option<&str> {
+        match self {
+            Effect::Launch { session, .. } | Effect::Extend { session, .. } => session.as_deref(),
+            // A relay goes back to the session its task belongs to, which the
+            // row cannot know; keeping it unscoped means a relay never displaces
+            // another session's relay.
+            Effect::Relay { .. } => None,
         }
     }
 
@@ -470,18 +494,24 @@ impl Effects {
 
     /// Drop every waiting row a task has of this kind. A row already running
     /// finishes normally.
-    pub fn cancel(&self, kind: Kind, key: &str) {
+    pub fn cancel(&self, kind: Kind, task_id: &str) {
+        // Matched on the effect's own `key()` — the bare task id a caller names —
+        // rather than on the row key. Rows are namespaced by session now, and a
+        // caller asking to cancel `T1` should not have to know which session's
+        // queue it landed in.
         let seq = {
             let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
             let found = rows
                 .iter()
-                .find(|row| row.effect.kind() == kind && row.effect.key() == key)
-                .map(|row| row.seq);
-            rows.retain(|row| !(row.effect.kind() == kind && row.effect.key() == key));
+                .find(|row| row.effect.kind() == kind && row.effect.key() == task_id)
+                .map(|row| (row.seq, row.effect.row_key()));
+            rows.retain(|row| !(row.effect.kind() == kind && row.effect.key() == task_id));
             found
         };
-        if let Some(seq) = seq {
-            self.record_state(kind, key, seq, crate::effects_log::State::Cancelled);
+        if let Some((seq, row_key)) = seq {
+            // The log's `done`/`cancelled` line must carry the same key the
+            // `queued` line used, or it retires nothing and the row reappears.
+            self.record_state(kind, &row_key, seq, crate::effects_log::State::Cancelled);
         }
     }
 
@@ -784,6 +814,34 @@ mod tests {
         }
         queue.dispatch(|_| Ok(()));
         assert!(!queue.broken(Kind::Launch));
+    }
+
+    /// Two main sessions share one queue, and each picks its own task ids.
+    ///
+    /// Nothing stops two of them from both calling their task `T1` — and when
+    /// they do, a row keyed only by task id makes the second launch **replace**
+    /// the first. One session's work then silently never runs, while the person
+    /// sees a task marked `working` that no child is doing.
+    #[test]
+    fn two_sessions_with_the_same_task_id_do_not_replace_each_other() {
+        let queue = Effects::new();
+        let launch = |session: &str, node: &str| Effect::Launch {
+            task_id: "T1".into(),
+            nodes: vec![node.into()],
+            max_parallel: 1,
+            binding: Binding::default(),
+            session: Some(session.into()),
+            graph: None,
+            rpi_exe: None,
+            wave: 0,
+        };
+        queue.enqueue(launch("session-A", "a"));
+        queue.enqueue(launch("session-B", "b"));
+        assert_eq!(
+            queue.rows().len(),
+            2,
+            "one session's launch replaced the other's"
+        );
     }
 
     #[test]
