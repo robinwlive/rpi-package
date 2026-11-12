@@ -29,6 +29,12 @@ pub const MAX_TIER: u32 = 8;
 pub const DETAILS_VERSION: u32 = 1;
 pub const MAX_TASK_BYTES: usize = 20_000;
 
+/// How much of a node's task `render` shows before cutting it off.
+///
+/// A task can be 20 KB; a status view that prints them in full is unreadable and
+/// costs the caller a small fortune in tokens for no added answer.
+pub const TASK_PREVIEW_CHARS: usize = 120;
+
 /// Thinking levels a node may name (`rpi-ai`'s `ThinkingLevel`, lowercase).
 pub const THINKING_LEVELS: &[&str] = &[
     "off", "minimal", "low", "medium", "high", "xhigh", "max",
@@ -135,6 +141,13 @@ pub struct Node {
     /// Why a node failed. `render` shows it so a blocked Ticket is explainable
     /// to a human, not just marked `!`.
     pub error: Option<String>,
+    /// When this node's child started, in ms since the epoch; 0 when it has not.
+    ///
+    /// Without it "how far along is it" has no answer a caller can trust: a
+    /// `running` mark says something is happening, not that it started two
+    /// seconds or twenty minutes ago. It is the one progress signal that costs
+    /// nothing to record and cannot be wrong.
+    pub started_at: u64,
 }
 
 impl Node {
@@ -223,6 +236,7 @@ impl Node {
             status: Status::Pending,
             result: None,
             error: None,
+            started_at: 0,
         })
     }
 
@@ -242,6 +256,7 @@ impl Node {
             "maxTurns": self.max_turns,
             "timeoutSeconds": self.timeout_secs,
             "status": self.status.as_str(),
+            "startedAt": self.started_at,
             "result": self.result,
             "error": self.error,
         })
@@ -348,6 +363,10 @@ impl Graph {
                 .get("error")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            // Carried through the round trip like `status`: a wave that reads the
+            // plan back and continues it must not lose when each child started,
+            // or the elapsed time resets to "just now" on every wave.
+            node.started_at = item.get("startedAt").and_then(Value::as_u64).unwrap_or(0);
             built.push(node);
         }
         let graph = Graph {
@@ -492,7 +511,23 @@ impl Graph {
             .iter()
             .filter(|node| node.status == Status::Done)
             .count();
-        let mut lines = vec![format!("{done}/{} done", self.nodes.len())];
+        let running = self
+            .nodes
+            .iter()
+            .filter(|node| node.status == Status::Running)
+            .count();
+        let pending = self
+            .nodes
+            .iter()
+            .filter(|node| node.status == Status::Pending)
+            .count();
+        // The counts a person asks for first: how many are actually moving right
+        // now, and how many are still waiting. `done/total` alone cannot tell a
+        // wave that is running everything from one that has not started.
+        let mut lines = vec![format!(
+            "{done}/{} done, {running} running, {pending} pending",
+            self.nodes.len()
+        )];
         for node in &self.nodes {
             let mark = match node.status {
                 Status::Done => "x",
@@ -515,6 +550,28 @@ impl Graph {
                 node.id,
                 node.status.as_str()
             );
+            // The task text, so a person asking "what is each worker doing" gets an
+            // answer from the plan itself instead of from memory of the call that
+            // wrote it. Trimmed to one readable line: this is a status view, and a
+            // 20 KB node task would bury the other nodes.
+            let task = node.task.replace('\n', " ");
+            let task = task.trim();
+            if !task.is_empty() {
+                let shown = if task.chars().count() > TASK_PREVIEW_CHARS {
+                    let cut: String = task.chars().take(TASK_PREVIEW_CHARS).collect();
+                    format!("{cut}…")
+                } else {
+                    task.to_string()
+                };
+                line.push_str(&format!(" — {shown}"));
+            }
+            // How long it has been going. The one progress signal that costs
+            // nothing and cannot be wrong; `running` alone does not separate
+            // "just started" from "stuck for twenty minutes".
+            if node.status == Status::Running && node.started_at > 0 {
+                let elapsed = crate::effects_log::now_ms().saturating_sub(node.started_at) / 1000;
+                line.push_str(&format!(" ({})", human_secs(elapsed)));
+            }
             if let Some(error) = &node.error {
                 let one_line = error.replace('\n', " ");
                 let one_line = one_line.trim();
@@ -525,6 +582,15 @@ impl Graph {
             lines.push(line);
         }
         lines.join("\n")
+    }
+}
+
+/// A duration in seconds, short enough for one status line.
+fn human_secs(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m{}s", seconds / 60, seconds % 60),
+        _ => format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60),
     }
 }
 
@@ -592,7 +658,92 @@ mod tests {
         let mut g = graph(json!([{"id": "ok", "task": "x"}]));
         g.get_mut("ok").unwrap().status = Status::Done;
         let rendered = g.render();
-        assert!(!rendered.contains("—"), "got: {rendered}");
+        // The task preview also uses an em dash, so check what the error rule
+        // actually promises: the node's own task text appears, and nothing is
+        // appended after it.
+        assert_eq!(rendered.lines().last().unwrap(), "[x] ok done — x");
+    }
+
+    /// A person asking "what is each worker doing" must get an answer from the
+    /// plan, not from their memory of the call that wrote it.
+    #[test]
+    fn render_names_each_nodes_task() {
+        let g = graph(json!([
+            {"id": "alpha", "task": "audit the routing layer"},
+            {"id": "beta", "task": "rewrite the auth middleware"}
+        ]));
+        let rendered = g.render();
+        assert!(rendered.contains("audit the routing layer"), "got: {rendered}");
+        assert!(rendered.contains("rewrite the auth middleware"), "got: {rendered}");
+    }
+
+    /// A 20 KB task must not bury the other nodes in the status view.
+    #[test]
+    fn render_truncates_a_long_task_and_stays_char_safe() {
+        let long = "界".repeat(TASK_PREVIEW_CHARS * 2);
+        let g = graph(json!([{"id": "a", "task": long}]));
+        let rendered = g.render();
+        assert!(rendered.ends_with('…'), "got: {rendered}");
+        // Bound the node line, not the whole render: the header grew a counts
+        // line and has nothing to do with the preview limit.
+        let node_line = rendered.lines().last().unwrap();
+        assert!(
+            node_line.chars().count() < TASK_PREVIEW_CHARS + 40,
+            "preview was not bounded: {node_line}"
+        );
+    }
+
+    /// "How many are running right now" is the first thing a person asks, and
+    /// `done/total` cannot answer it.
+    #[test]
+    fn render_counts_running_and_pending_separately() {
+        let mut g = graph(json!([
+            {"id": "a", "task": "a"},
+            {"id": "b", "task": "b"},
+            {"id": "c", "task": "c"}
+        ]));
+        g.get_mut("a").unwrap().status = Status::Running;
+        g.get_mut("b").unwrap().status = Status::Done;
+        let header = g.render().lines().next().unwrap().to_string();
+        assert!(header.contains("1/3 done"), "got: {header}");
+        assert!(header.contains("1 running"), "got: {header}");
+        assert!(header.contains("1 pending"), "got: {header}");
+    }
+
+    /// A running node shows how long it has been going: `running` alone does not
+    /// separate "just started" from "stuck for twenty minutes".
+    #[test]
+    fn render_shows_elapsed_time_for_a_running_node() {
+        let mut g = graph(json!([{"id": "a", "task": "a"}]));
+        let node = g.get_mut("a").unwrap();
+        node.status = Status::Running;
+        node.started_at = crate::effects_log::now_ms().saturating_sub(90_000);
+        let rendered = g.render();
+        assert!(rendered.contains("(1m30s)"), "got: {rendered}");
+    }
+
+    /// A node that has not started must not claim an elapsed time.
+    #[test]
+    fn render_omits_elapsed_time_for_a_pending_node() {
+        let g = graph(json!([{"id": "a", "task": "a"}]));
+        assert!(!g.render().contains('('), "got: {}", g.render());
+    }
+
+    #[test]
+    fn human_secs_reads_as_minutes_and_hours() {
+        assert_eq!(human_secs(0), "0s");
+        assert_eq!(human_secs(59), "59s");
+        assert_eq!(human_secs(90), "1m30s");
+        assert_eq!(human_secs(3700), "1h1m");
+    }
+
+    /// A multi-line task would otherwise break the one-line-per-node shape.
+    #[test]
+    fn render_folds_a_multiline_task_onto_one_line() {
+        let g = graph(json!([{"id": "a", "task": "step one\nstep two\nstep three"}]));
+        let rendered = g.render();
+        assert_eq!(rendered.lines().count(), 2, "got: {rendered}");
+        assert!(rendered.contains("step one step two step three"));
     }
 
     #[test]
@@ -819,3 +970,4 @@ mod tests {
         assert!(!g.has_pending());
     }
 }
+

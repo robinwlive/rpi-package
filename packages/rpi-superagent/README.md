@@ -16,9 +16,11 @@ kernel plus a small layer that keeps a task alive across restarts.
 MIT, Copyright (c) 2026 BigFish), renamed and re-scoped. The execution kernel is
 inherited unchanged; the long-task layer is new work.
 
-- **Execution kernel (inherited).** `superagent_plan` authors a task DAG,
-  `superagent_dispatch` runs one ready wave of it in bounded child processes,
-  `superagent_delegate` runs a single bounded task. Turn and wall-clock budgets,
+- **Execution kernel (inherited).** `superagent_plan` authors a task DAG and
+  `superagent_dispatch` queues one ready wave of it in bounded child processes.
+  Dispatch is always asynchronous: it returns at once and the wave's report
+  arrives later as a message, because a blocking one-shot child is work the
+  calling session could have done itself. Turn and wall-clock budgets,
   per-node acceptance checks, process-tree cancellation and the recursion guard
   are all enforced in code, not asked of the model.
 - **Long-task layer (new, in progress).** A `Task` survives a restart, so a job
@@ -43,8 +45,7 @@ unified plugin ABI).
 | Tool | Purpose |
 | --- | --- |
 | `superagent_plan` | Author or edit the task DAG: `set` replaces nodes, `update` applies `addNodes` / `removeIds` / `setDeps` / `reset` atomically, `show` inspects. |
-| `superagent_dispatch` | Run one wave: every pending node whose dependencies are done at wave start, in batches up to `maxParallel`. Newly unblocked nodes wait for the next call. |
-| `superagent_delegate` | Run one bounded task in a fresh `rpi` subprocess. Not the host-managed in-memory `delegate_task`; use that for in-process delegation on the current execution binding. |
+| `superagent_dispatch` | Queue one wave and return at once: every pending node whose dependencies are done at wave start, in batches up to `maxParallel`. A wave that unblocks more nodes queues the next one itself; the report arrives as a message. |
 | `superagent_task` | Track a long task across restarts: `create` it, `update` its state, `list` them. |
 
 ## Relationship to `rpi-orchestrator`
@@ -53,7 +54,7 @@ unified plugin ABI).
 >
 > They overlap: `rpi-orchestrator` exposes `plan` / `dispatch` / `subagent` and
 > this package exposes `superagent_plan` / `superagent_dispatch` /
-> `superagent_delegate` — the same workflow under two names, and the same
+> `superagent_dispatch` — the same workflow under two names, and the same
 > project goal under one `.rpi/goals.json`.
 >
 > If both are installed, this package detects its neighbour and **stands down**

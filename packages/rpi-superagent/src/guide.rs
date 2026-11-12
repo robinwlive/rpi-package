@@ -32,25 +32,48 @@ const TOOLS_HEADING: &str = "## Super-agent tools";
 
 const TOOLS_SECTION: &str = r#"## Super-agent tools
 
-These four tools work together. Use them in this order:
+These three tools work together. Use them in this order:
 
+- `superagent_task` — create the long task and give it an id.
 - `superagent_plan` — author a task DAG: nodes, dependencies, acceptance checks.
-- `superagent_dispatch` — run one ready wave of it in parallel child processes.
-- `superagent_delegate` — run one bounded task in a child process, when the work
-  has no dependencies and needs no scheduling.
-- `superagent_task` — track a long task across restarts: create it, record its
-  state, list them.
+  Pass the task's id as `taskId`.
+- `superagent_dispatch` — queue one ready wave of it in parallel child processes.
 
 When to use which:
 
-- Work with several steps, or steps that can run in parallel → `superagent_plan`
-  then `superagent_dispatch`.
-- One self-contained task → `superagent_delegate`.
+- Work with several steps, or steps that can run in parallel → `superagent_task`,
+  `superagent_plan`, then `superagent_dispatch`.
 - Work that should outlive one turn, or that you need to pick up after a
-  restart → also use `superagent_task`: create it, and pass its `taskId` to
+  restart → create it with `superagent_task`, and pass its `taskId` to
   `superagent_plan`, so dispatch records its progress without you updating it
   by hand. Check `superagent_task` with action=list at the start of a session
   to see what was already in flight.
+
+**`superagent_dispatch` returns immediately.** It queues the wave and the wave
+runs in the background; you get the report later as a message in this session.
+Never wait for it, never re-dispatch the same wave to "check" on it, and go on
+with other work — that is the whole point of running it in a child process. If
+you would have to wait for the result to take your next step, do that step in
+this session instead of dispatching it.
+
+**Answering "how many are running, doing what, how far along":**
+
+`superagent_plan(action=show)` answers all three from live state:
+
+```
+0/3 done, 1 running, 1 pending
+[~] alpha running — Audit the routing layer (1m33s)
+[!] beta failed — Rewrite the auth middleware — expected file was not produced
+[ ] gamma pending deps=[alpha,beta] — Run the full test suite
+```
+
+The header counts what is moving now; each line names the node's task and, for a
+running node, how long it has been going. Read the answer from this output rather
+than from your memory of the `plan(set)` call that wrote it — and never guess a
+progress figure the output does not contain.
+
+There is no single-task delegation tool. One node with no dependencies *is* a
+single task, so write a one-node plan — the same work, plus the report.
 
 A node that exits 0 may still have hit its turn cap, so declare `expectFile` or
 `verify` acceptance checks and let dispatch judge the node.
@@ -72,11 +95,11 @@ tell the worker on the retry. Only ask your human when the answer is something
 you cannot decide — a choice that changes the goal, spends money, or deletes
 something they own.
 
-Why not answer it live: the worker waits on stdin, this dispatch call is
-synchronous, and you are the party blocked inside it. There is no "answer while
-waiting" — that is why the question comes back as a result instead of as a
-conversation. Re-dispatching costs one extra node run; waiting for a person who
-may be away for hours costs the whole task."#;
+Why not answer it live: the worker runs as a one-shot child and waits on its own
+stdin, so nothing in this session is listening to it. The question arrives as a
+result, not as a conversation, long after the dispatch call that started it
+returned. Re-dispatching costs one extra node run; waiting for a person who may
+be away for hours costs the whole task."#;
 
 const GUIDE_SECTION: &str = r#"## Super-agent orchestration
 
@@ -210,18 +233,20 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_guidance_names_all_four_tools_and_says_when_to_use_each() {
-        for tool in [
-            "superagent_plan",
-            "superagent_dispatch",
-            "superagent_delegate",
-            "superagent_task",
-        ] {
+    fn the_tool_guidance_names_every_registered_tool_and_when_to_use_each() {
+        // Keep this list equal to the tools `lib.rs` registers: a tool the
+        // prompt never names is a tool the model will not call, and a name here
+        // that `lib.rs` no longer registers is one it will call and fail.
+        for tool in ["superagent_plan", "superagent_dispatch", "superagent_task"] {
             assert!(TOOLS_SECTION.contains(tool), "{tool} missing from the section");
         }
         // The section must say when to reach for a tool, not only what it does.
         assert!(TOOLS_SECTION.contains("When to use which"));
         assert!(TOOLS_SECTION.contains("action=list"));
+        // Dispatch is asynchronous now; the model must not be told to wait on
+        // it, which is exactly what the old wording implied.
+        assert!(!TOOLS_SECTION.contains("superagent_delegate"));
+        assert!(TOOLS_SECTION.contains("returns immediately"));
     }
 
     #[test]

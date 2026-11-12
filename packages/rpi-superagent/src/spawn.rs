@@ -24,7 +24,7 @@ use crate::control::Control;
 
 /// Tools this package registers. Excluded from the child's tool set so a
 /// subagent cannot recursively orchestrate (design §8 "递归守卫").
-pub const EXCLUDED_TOOLS: &str = "superagent_delegate,superagent_dispatch,superagent_plan";
+pub const EXCLUDED_TOOLS: &str = "superagent_dispatch,superagent_plan";
 
 /// Upper bound on the text fed back to the orchestrator (design §8 "输出截断").
 pub const MAX_OUTPUT_BYTES: usize = 40_000;
@@ -507,30 +507,12 @@ pub(crate) fn collect_reader(
     }
 }
 
-/// Run one delegation using the current executable as the child `rpi`.
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    task: &str,
-    max_turns: u64,
-    timeout_secs: u64,
-    provider: Option<&str>,
-    model: Option<&str>,
-    control: &Control,
-) -> Result<String, String> {
-    let exe = std::env::current_exe()
-        .map_err(|err| format!("cannot resolve the rpi executable: {err}"))?;
-    run_with_exe(
-        &exe,
-        task,
-        max_turns,
-        timeout_secs,
-        provider,
-        model,
-        control,
-    )
-}
-
 /// Run one delegation with an explicit executable (test seam).
+///
+/// Test-only: a blocking one-shot delegation no longer has a tool behind it, so
+/// the production path is `run_child_reporting` through a dispatch wave. These
+/// wrappers stay as the seam the spawn tests drive that path with.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_exe(
     exe: &Path,
@@ -552,6 +534,7 @@ pub fn run_with_exe(
 /// the host died and left it running.
 // The argument list mirrors `run_with_exe` plus the callback; splitting it into
 // a struct would mean rewriting every caller for one extra field.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_exe_reporting(
     exe: &Path,

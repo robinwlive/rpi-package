@@ -33,9 +33,6 @@ fn node_schema() -> Value {
 
 fn parameters(name: &str) -> Value {
     match name {
-        "superagent_delegate" => {
-            json!({"type":"object", "properties":worker_properties(), "required":["task"], "additionalProperties":true})
-        }
         "superagent_plan" => json!({
             "type":"object", "additionalProperties":true,
             "properties":{
@@ -50,7 +47,7 @@ fn parameters(name: &str) -> Value {
             "allOf":[{"if":{"properties":{"action":{"const":"set"}},"required":["action"]},"then":{"required":["nodes"]}}]
         }),
         "superagent_dispatch" => {
-            json!({"type":"object", "additionalProperties":true, "properties":{"maxParallel":{"type":"integer", "minimum":1, "maximum":16, "default":4, "description":"Concurrent children within this wave, 1..16; default 4. All nodes ready at wave start are attempted, in batches if needed."},"async":{"type":"boolean", "default":false, "description":"Queue the wave and return at once instead of waiting for it. The wave runs on a background scheduler; its result arrives as a message in this session. Requires a taskId (name it in plan), because the result is reported against a task. Use this when you want to keep taking requests while a wave runs; leave it off when the next step depends on this one."}}})
+            json!({"type":"object", "additionalProperties":true, "properties":{"maxParallel":{"type":"integer", "minimum":1, "maximum":16, "default":4, "description":"Concurrent children within this wave, 1..16; default 4. All nodes ready at wave start are attempted, in batches if needed."}}})
         }
         "superagent_task" => {
             json!({
@@ -72,10 +69,9 @@ fn parameters(name: &str) -> Value {
 
 pub(super) fn tool_schema(name: &str) -> StableToolSchema {
     let description = match name {
-        "superagent_delegate" => "Run one bounded task in a fresh rpi subprocess, not the host-managed in-memory delegate_task. No parent conversation is copied; pass scope, file ownership, constraints and acceptance criteria in task. The child shares cwd/files/environment (no isolated worktree or sandbox), so avoid concurrent writes to the same files. Returns bounded output, not proof of task completion; inspect and verify it. Children cannot call superagent_delegate/superagent_plan/superagent_dispatch. Prefer the host-managed delegate_task tool for in-process delegation on the current execution binding, or superagent_plan + superagent_dispatch for dependency scheduling.",
         "superagent_task" => "Track a long task across restarts. create writes a task, update records a new state for it, and list shows every task with its latest state. State is stored in the session branch, so it survives a process restart but is scoped to the current branch: rewinding the session hides the task list. Use this for work that outlives one turn; use plan/dispatch for the execution graph itself.",
         "superagent_plan" => "Author the session-scoped in-memory execution DAG, NOT plan_mode's read-only design/approval workflow. set replaces nodes; update applies addNodes, removeIds, setDeps, reset in that order and validates atomically; show (default) inspects. Only edit between dispatch waves. Nodes need self-contained tasks; give a node isolation:true when it writes files, so parallel nodes cannot overwrite each other. Declare expectFile/verify acceptance checks: only dispatch can mark completion, and exit 0 alone can include a turn-limited incomplete answer. Session switches clear this graph; it is not a durable queue. Pass taskId to bind the plan to a long task: dispatch then records the plan's progress on that task by itself. A node's `session` names the worker's saved conversation: reuse one name across the nodes of a task that continues (the worker keeps its history, its context, and its prefix cache, and will not repeat side effects it already performed), and leave it unset for independent one-off nodes (sharing one would show each node the others' unrelated work).",
-        "superagent_dispatch" => "Execute one ready wave of the current plan using bounded rpi child processes. Call superagent_plan(action=set) first. All pending nodes whose dependencies are done at wave start run in batches up to maxParallel; newly unblocked nodes wait for the next call. Overlapping dispatch/edit calls are rejected. Inspect results and acceptance checks before the next wave; failed dependencies cause skipped nodes, and retries require explicit plan(update, reset). Shared files are not isolated: parallelize only independent work. With async=true the wave is queued and this returns immediately; the result then arrives as a message in this session, and superagent_task(action=list) shows progress. Returns bounded per-node summaries and the updated graph.",
+        "superagent_dispatch" => "Queue one ready wave of the current plan and return at once; it runs on the background scheduler in bounded rpi child processes. Call superagent_plan(action=set, taskId=...) first — the taskId is required, because the wave's report is delivered against it. All pending nodes whose dependencies are done at wave start run in batches up to maxParallel, and a wave that unblocks more nodes queues the next wave by itself. The report arrives later as a message in this session; superagent_task(action=list) shows progress meanwhile. Overlapping dispatch/edit calls are rejected. Inspect results and acceptance checks before editing the plan; failed dependencies cause skipped nodes, and retries require explicit plan(update, reset). Shared files are not isolated: parallelize only independent work.",
         _ => unreachable!("unknown superagent tool"),
     };
     crate::kit::schema(name, description, &parameters(name).to_string())
@@ -95,13 +91,16 @@ mod tests {
 
     #[test]
     fn registered_schemas_are_json_and_allow_host_context() {
-        for name in ["superagent_delegate", "superagent_plan", "superagent_dispatch", "superagent_task"] {
+        for name in ["superagent_plan", "superagent_dispatch", "superagent_task"] {
             let schema = registered(name);
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["additionalProperties"], true); // includes __rpi
             assert!(schema["properties"].is_object());
         }
-        assert_eq!(registered("superagent_delegate")["required"], json!(["task"]));
+        assert_eq!(registered("superagent_plan")["properties"]["action"]["default"], "show");
+        // Dispatch is always asynchronous now: an `async` switch would only
+        // offer back the blocking mode this package no longer has.
+        assert!(registered("superagent_dispatch")["properties"]["async"].is_null());
         // The node schema has to offer `isolation`, or the model has no way to
         // ask for an isolated working directory.
         let node = &registered("superagent_plan")["properties"]["nodes"]["items"];

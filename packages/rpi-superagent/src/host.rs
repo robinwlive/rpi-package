@@ -673,12 +673,24 @@ mod tests {
 mod binding_cache_tests {
     use super::*;
 
+    /// The cache is process-global, so these tests must not interleave.
+    ///
+    /// Without this they pass or fail depending on test order: one test's
+    /// `remember_binding` lands between another's write and its read. The guard
+    /// is per-module and released on panic (a failed test still unlocks it).
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// A remembered binding is only handed back to the session that recorded it.
     ///
     /// Two sessions can run on different accounts; reusing one's model for the
     /// other is precisely the cross-account mistake this module prevents.
     #[test]
     fn a_remembered_binding_is_bound_to_its_session() {
+        let _serial = guard();
         let selection = Selection {
             provider: Some("magpie".into()),
             model: Some("m-1".into()),
@@ -698,6 +710,7 @@ mod binding_cache_tests {
     /// not overwrite a good one.
     #[test]
     fn an_empty_binding_does_not_clobber_a_good_one() {
+        let _serial = guard();
         let good = Selection {
             provider: Some("magpie".into()),
             model: Some("m-1".into()),

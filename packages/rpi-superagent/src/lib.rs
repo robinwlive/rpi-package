@@ -14,9 +14,13 @@
 //! A subagent is a child `rpi` process. Three tools share one session-scoped
 //! task graph:
 //!
-//! - `subagent` — run one bounded task (the delegation primitive),
 //! - `plan`     — author/edit the DAG,
-//! - `dispatch` — run the ready set (one wave per call).
+//! - `dispatch` — queue the ready set (one wave per call),
+//! - `task`     — track a long task across restarts.
+//!
+//! There is no single-task delegation tool. A blocking one-shot child is what the
+//! calling session could do itself, and a non-blocking one is a one-node plan —
+//! so it was a second name for the same workflow with none of the reporting.
 //!
 //! The graph lives in this process's memory for the life of a run. Switching
 //! sessions clears it — a human decides whether to resume or start over, rather
@@ -38,7 +42,6 @@ pub mod passes_daemon;
 mod plan;
 mod prompt;
 mod spawn;
-mod subagent;
 pub mod supervisor;
 mod task;
 mod workspace;
@@ -282,7 +285,6 @@ impl GraphState {
     }
 }
 
-crate::tool_entry!(subagent_tool, crate::subagent::subagent);
 crate::tool_entry!(plan_tool, crate::plan::plan);
 crate::tool_entry!(dispatch_tool, crate::dispatch::dispatch);
 crate::tool_entry!(task_tool, crate::task::task);
@@ -384,22 +386,6 @@ rpi_plugin_sdk::export_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };
-
-    {
-        let schema = Box::new(crate::tool_schema::tool_schema("superagent_delegate"));
-        let rc = register(
-            &*schema,
-            subagent_tool::execute,
-            subagent_tool::poll,
-            subagent_tool::cancel,
-            subagent_tool::destroy,
-            crate::kit::plugin_free_string,
-        );
-        drop(schema);
-        if rc != 0 {
-            return 1;
-        }
-    }
 
     {
         let schema = Box::new(crate::tool_schema::tool_schema("superagent_plan"));
@@ -550,6 +536,54 @@ mod tests {
             .all(|node| node.status == graph::Status::Done));
     }
 
+    /// `started_at` is what makes "how far along is it" answerable, and it is
+    /// written on the real dispatch path — the same one a wave takes, with the
+    /// children replaced by a fixture so no network is involved.
+    #[test]
+    fn a_started_node_records_when_it_started_and_keeps_it_across_waves() {
+        let _serial = graph_test_guard();
+        let params = params_for(Some("started-at"));
+        let control = crate::control::Control::default();
+        let progress = std::sync::mpsc::channel().0;
+        let mut set = params.clone();
+        set["action"] = serde_json::json!("set");
+        set["nodes"] = serde_json::json!([{"id": "a", "task": "a"}, {"id": "b", "task": "b", "deps": ["a"]}]);
+        crate::plan::plan(&set, &control, &progress).unwrap();
+
+        let fixture = |_: &graph::Graph,
+                       ready: &[String],
+                       _: usize,
+                       _: &crate::control::Control,
+                       _: &crate::kit::Progress,
+                       _: &crate::host::Selection,
+                       _: &std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+                       _: &str,
+                       _: Option<&str>| {
+            ready
+                .iter()
+                .map(|id| (id.clone(), Ok("ok".into())))
+                .collect()
+        };
+        crate::dispatch::dispatch_with(&params, &control, &progress, fixture).unwrap();
+        let first = {
+            let state = lock_graph(&params);
+            let node = state.graph().get("a").unwrap();
+            assert_eq!(node.status, graph::Status::Done);
+            assert!(node.started_at > 0, "a started node recorded no start time");
+            node.started_at
+        };
+
+        // The second wave must not move the first wave's start time.
+        crate::dispatch::dispatch_with(&params, &control, &progress, fixture).unwrap();
+        let state = lock_graph(&params);
+        assert_eq!(
+            state.graph().get("a").unwrap().started_at,
+            first,
+            "a later wave rewrote an earlier start time"
+        );
+        assert!(state.graph().get("b").unwrap().started_at > 0);
+    }
+
     #[test]
     fn verification_keeps_plan_readable_and_does_not_commit_into_a_new_session() {
         use std::time::{Duration, Instant};
@@ -641,8 +675,41 @@ mod tests {
         );
     }
 
+    /// Dispatch never runs a wave itself: it queues one and returns. A blocking
+    /// dispatch is the mode this package dropped — it made the caller wait inside
+    /// a tool call for work the calling session could have done directly — so the
+    /// tool is now only allowed to hand the work to the scheduler.
+    ///
+    /// The wave itself is left to the scheduler here, which is what makes this a
+    /// test of the tool rather than of `run_wave`: no child is ever spawned.
     #[test]
-    fn running_wave_rejects_plan_edits_and_overlapping_dispatch() {
+    fn dispatch_queues_and_returns_without_running_the_wave() {
+        let _serial = graph_test_guard();
+        let params = params_for(Some("always-async"));
+        let control = crate::control::Control::default();
+        let progress = std::sync::mpsc::channel().0;
+        let mut set = params.clone();
+        set["action"] = serde_json::json!("set");
+        set["taskId"] = serde_json::json!("always-async-task");
+        set["nodes"] = serde_json::json!([{"id":"x", "task":"never runs here"}]);
+        crate::plan::plan(&set, &control, &progress).unwrap();
+        crate::effects().cancel(crate::effects::Kind::Launch, "always-async-task");
+
+        let reply = crate::dispatch::dispatch(&params, &control, &progress).unwrap();
+        let queued = crate::effects().pending(crate::effects::Kind::Launch, "always-async-task");
+        // Relase the row before asserting, so a failure does not leave the
+        // process-global queue holding work for a later test.
+        crate::effects().cancel(crate::effects::Kind::Launch, "always-async-task");
+
+        assert!(reply.contains("queued"), "dispatch did not queue: {reply}");
+        assert!(queued, "dispatch returned without queueing a wave");
+        // The node is still pending: nothing ran inline, so no result was written.
+        let state = lock_graph(&params);
+        assert_eq!(state.graph().get("x").unwrap().status, graph::Status::Pending);
+    }
+
+    #[test]
+    fn a_running_wave_cannot_be_queued_again() {
         let _serial = graph_test_guard();
         let params = params_for(Some("busy-wave"));
         let control = crate::control::Control::default();
@@ -665,12 +732,12 @@ mod tests {
                 .unwrap_err()
                 .contains("dispatch is running"));
         }
-        assert!(crate::plan::plan(&params, &control, &progress)
-            .unwrap()
-            .contains("original"));
         assert!(crate::dispatch::dispatch(&params, &control, &progress)
             .unwrap_err()
             .contains("already running"));
+        assert!(crate::plan::plan(&params, &control, &progress)
+            .unwrap()
+            .contains("original"));
         {
             let mut guard = lock_graph_for_wave(&params, generation).unwrap();
             assert_eq!(

@@ -11,6 +11,10 @@
 
 **rpi-superagent = fork 自 rpi-orchestrator 的执行内核 + 一个最小的长任务层。**
 
+**2026-11-12 变更**：`superagent_delegate` 已删除，`superagent_dispatch` 固定为异步。
+下文描述的是 fork 当时的三工具形态，改名映射与架构图保留作历史记录；
+当前形态见 README 的 Tools 表。
+
 **目标**：把「一个长任务」从「人盯着它跑」变成「人只在需要裁决时才出现」。
 完整目标陈述与验收标准见 [`00-GOALS-AND-DECISIONS.md`](00-GOALS-AND-DECISIONS.md) §1。
 

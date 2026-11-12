@@ -47,7 +47,7 @@
     "name": "rpi-superagent",
     "version": "0.1.12",
     "type": "extension",
-    "tool": "superagent_plan + superagent_dispatch + superagent_delegate + superagent_task",
+    "tool": "superagent_plan + superagent_dispatch + superagent_task",
     "inspiredBy": "Long tasks that survive a restart",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-superagent",

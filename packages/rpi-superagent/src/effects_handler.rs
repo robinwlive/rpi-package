@@ -189,7 +189,11 @@ fn run_launch(
     if let Some(exe) = rpi_exe {
         params["rpiExe"] = serde_json::Value::String(exe.to_string());
     }
-    match crate::dispatch::dispatch(&params, &control, &progress) {
+    // The wave runs *here*, not through the tool: the tool only queues, so
+    // calling it would enqueue this row right back and the queue would spin.
+    // `dispatch_with` is the inline executor the tool used to call.
+    match crate::dispatch::dispatch_with(&params, &control, &progress, crate::dispatch::run_wave)
+    {
         Ok(text) => {
             // The wave finished. `relay` carries the outcome to whoever can
             // deliver it; the caller decides how, because a relay queued into

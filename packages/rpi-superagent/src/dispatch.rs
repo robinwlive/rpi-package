@@ -1,10 +1,16 @@
-//! The `dispatch` tool: run one wave of the DAG.
+//! The `dispatch` tool: queue one wave of the DAG.
 //!
 //! Scheduling is deterministic code, not a model decision: the ready set is
 //! "pending nodes whose dependencies are all done", and it is executed with at
 //! most `maxParallel` concurrent child processes. One call advances **one wave**,
 //! so the orchestrator sees the results and can reshape the graph before the
 //! next call.
+//!
+//! The tool **never runs the wave itself**. A blocking dispatch made the caller
+//! wait inside a tool call for work it could have started in this session
+//! directly, which is the one thing a child process buys nothing for. So the
+//! tool only queues; [`crate::passes`] or the daemon runs the wave, and its
+//! report reaches the session as a relay message.
 
 use crate::control::Control;
 use crate::graph::{Graph, Status};
@@ -28,9 +34,19 @@ const MIN_VERIFY_SECS: u64 = 10;
 pub fn dispatch(
     params: &Value,
     control: &Control,
-    progress_tx: &Progress,
+    _progress_tx: &Progress,
 ) -> Result<String, String> {
-    dispatch_with(params, control, progress_tx, run_wave)
+    control.check()?;
+    let max_parallel = max_parallel_of(params);
+    queue_wave(params, max_parallel)
+}
+
+fn max_parallel_of(params: &Value) -> usize {
+    params
+        .get("maxParallel")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_PARALLEL as u64)
+        .clamp(1, MAX_PARALLEL_CAP as u64) as usize
 }
 
 /// Queue a wave and return immediately.
@@ -50,12 +66,21 @@ fn queue_wave(params: &Value, max_parallel: usize) -> Result<String, String> {
     // the two is missing.
     if crate::host::host_exits_after_this_turn() && !crate::effects().is_durable() {
         return Err(
-            "async dispatch needs something to run the wave after this turn, and this run \
-             has neither: it is one-shot (`rpi -p` or a bare prompt), and the effect log is \
-             not writable. Either drop `async` to run the wave inline, or run under \
-             `--mode rpc` / an interactive session, which stays up to drive the queue."
+            "dispatch needs something to run the wave after this turn, and this run has \
+             neither: it is one-shot (`rpi -p` or a bare prompt), and the effect log is not \
+             writable. Run under `--mode rpc` or an interactive session, which stays up to \
+             drive the queue."
                 .into(),
         );
+    }
+
+    // A second wave over the same graph would run nodes the first one already
+    // marked running. Refused here rather than at the scheduler, so the model
+    // gets an answer it can act on instead of a queued row that spins. Checked
+    // before the taskId so a caller who is simply too early is told that, rather
+    // than being sent to fix a taskId it may not need once the wave ends.
+    if lock_graph(params).is_running() {
+        return Err("dispatch is already running: wait for the current wave to finish".into());
     }
 
     let task_id = params
@@ -65,9 +90,10 @@ fn queue_wave(params: &Value, max_parallel: usize) -> Result<String, String> {
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .or_else(crate::graph_task_id)
-        .ok_or(
-            "action=dispatch with async requires a taskId: pass plan(taskId=...) so the result \
-             has a subject to report against",
+        .ok_or::<String>(
+            "dispatch requires a taskId: pass plan(taskId=...) so the wave's report has a \
+             subject to arrive against"
+                .into(),
         )?;
 
     // Everything the pass cannot ask for later is captured here, while the host
@@ -130,7 +156,7 @@ fn queue_wave(params: &Value, max_parallel: usize) -> Result<String, String> {
             n = ready.len(),
             ids = ready.join(", ")
         ),
-        serde_json::json!({"async": true, "taskId": task_id, "queued": ready}),
+        serde_json::json!({"taskId": task_id, "queued": ready}),
     ))
 }
 
@@ -151,22 +177,7 @@ pub(super) fn dispatch_with(
     ) -> Vec<(String, Result<String, String>)>,
 ) -> Result<String, String> {
     control.check()?;
-    let max_parallel = params
-        .get("maxParallel")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_MAX_PARALLEL as u64)
-        .clamp(1, MAX_PARALLEL_CAP as u64) as usize;
-
-    // Queue the wave and return, when the caller asked for that. The work then
-    // runs on the pass scheduler and reports back as a relay message, which is
-    // what lets a session keep taking requests while a wave is in flight.
-    if params
-        .get("async")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return queue_wave(params, max_parallel);
-    }
+    let max_parallel = max_parallel_of(params);
 
     let mut guard = lock_graph(params);
     if guard.is_running() {
@@ -207,6 +218,12 @@ pub(super) fn dispatch_with(
     for id in &ready {
         if let Some(node) = graph.get_mut(id) {
             node.status = Status::Running;
+            // Only when it is first set: a node restored to `pending` after a
+            // cancelled wave and retried keeps the original start, and a second
+            // wave must not overwrite the first wave's history.
+            if node.started_at == 0 {
+                node.started_at = crate::effects_log::now_ms();
+            }
         }
     }
 
