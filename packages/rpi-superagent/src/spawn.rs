@@ -464,12 +464,33 @@ fn spill_path(task: &str, node: &str) -> Option<std::path::PathBuf> {
     if task.is_empty() || node.is_empty() {
         return None;
     }
+    // A run-unique suffix, so one spill never overwrites another.
+    //
+    // `task` and `node` come from the model and the engine, and neither carries the
+    // session that produced them: two main sessions both calling a task `T1` and a
+    // node `n1` compute the same path. Spill is where the *complete* output goes
+    // when the summary is truncated, so an overwrite destroys the half that was cut
+    // from the summary — the node then has no readable full result at all.
+    //
+    // A retry of the same node also lands here, and its earlier output is still
+    // worth keeping until someone reads it. So each spill gets its own file.
+    //
+    // shortcut: nothing prunes `~/.pidd/node-output`, so it grows by one file per
+    // spilled node (only when the output exceeds MAX_OUTPUT_BYTES). Overwriting was
+    // worse — it destroyed a result that could not be recovered — so the trade is
+    // deliberate. Prune it by hand if it ever matters, or add an age-based sweep.
+    // Process id plus a counter, not a timestamp: two spills in the same
+    // millisecond (a parallel wave finishing together) would otherwise collide
+    // again, which is exactly the bug this is here to prevent.
+    static SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unique = format!("{}-{seq}", std::process::id());
     Some(
         std::path::PathBuf::from(home)
             .join(".pidd")
             .join("node-output")
             .join(task)
-            .join(format!("{node}.txt")),
+            .join(format!("{node}-{unique}.txt")),
     )
 }
 
@@ -891,6 +912,15 @@ pub struct RpcOutcome {
     pub questions: Vec<String>,
     /// Whether any `turn_end` or `agent_end` arrived, i.e. the worker actually ran.
     pub finished: bool,
+    /// Why the stream ended early, when it did.
+    ///
+    /// The reader loop stops on EOF, on a read error, and on its byte cap — and
+    /// only the first of those means "the worker said everything it had to say".
+    /// Without this the other two are indistinguishable from a clean finish: the
+    /// caller sees `finished` set by the last `turn_end` and treats a truncated
+    /// answer as the whole answer. A node then reports success on half a result
+    /// and nothing in its report lets a person tell.
+    pub truncated: Option<String>,
 }
 
 /// Fold one JSONL event line from an `rpc` worker.
@@ -1274,10 +1304,20 @@ where
                         }
                     }
                     if raw_bytes > MAX_OUTPUT_BYTES * 8 {
+                        // The cap exists so one runaway worker cannot exhaust
+                        // memory. Stopping here is right; pretending the output was
+                        // complete is not.
+                        outcome.truncated =
+                            Some(format!("output exceeded {} bytes", MAX_OUTPUT_BYTES * 8));
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(error) => {
+                    // Not EOF: the pipe broke. Whatever was folded so far may be
+                    // half an answer, so say so rather than let it pass as complete.
+                    outcome.truncated = Some(format!("read error: {error}"));
+                    break;
+                }
             }
         }
         if !pending.trim().is_empty() {
@@ -1294,6 +1334,14 @@ where
                 "[no turn_end / agent_end in the worker's output]\n{}",
                 raw_tail.trim_end()
             );
+        }
+        // The marker goes on **last**, so it cannot be buried by the reply text it
+        // is warning about.
+        if let Some(reason) = outcome.truncated.clone() {
+            outcome.reply.push_str(&format!(
+                "\n\n[worker output is INCOMPLETE: {reason}. What is above may be \
+                 half an answer; treat this node's result as unverified.]"
+            ));
         }
         let _ = sender.send(outcome);
     });
@@ -1410,6 +1458,85 @@ mod tests {
             let ui = serde_json::json!({"kind": "confirm", "message": message});
             assert_eq!(auto_answer(&ui), None, "不该代答: {message}");
         }
+    }
+
+    /// A read error mid-stream must not pass off a partial answer as complete.
+    ///
+    /// The reader loop `break`s on a read error and keeps whatever it folded so
+    /// far. If the stream had already produced a `turn_end`, `outcome.finished` is
+    /// true and the caller treats the truncated text as the worker's full answer —
+    /// so a node reports success on half a result, and the missing half is never
+    /// mentioned. A person reading that node's report has no way to tell.
+    ///
+    /// Drives the real reader with a stream that fails partway, which is the only
+    /// way to check the loop actually records it: asserting on a hand-built
+    /// outcome would test the struct, not the code.
+    #[test]
+    fn a_read_error_mid_stream_is_recorded_as_truncation() {
+        struct FailsAfter {
+            remaining: usize,
+        }
+        impl Read for FailsAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(std::io::Error::other("broken pipe"));
+                }
+                let line = serde_json::json!({
+                    "type": "turn_end",
+                    "message": {"content": [{"type": "text", "text": "half an answer"}]}
+                })
+                .to_string()
+                    + "\n";
+                let bytes = line.as_bytes();
+                let n = bytes.len().min(buf.len()).min(self.remaining);
+                buf[..n].copy_from_slice(&bytes[..n]);
+                self.remaining -= n;
+                Ok(n)
+            }
+        }
+
+        let (rx, handle) = spawn_event_reader_signalled(
+            FailsAfter {
+                remaining: 200,
+            },
+            |_| {},
+        );
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reader must finish");
+        handle.join().unwrap();
+
+        assert!(
+            outcome.truncated.is_some(),
+            "the read error was swallowed: the caller cannot tell the answer is partial"
+        );
+        assert!(
+            outcome.reply.contains("INCOMPLETE"),
+            "the reply does not warn that it is partial: {}",
+            outcome.reply
+        );
+    }
+
+    /// A clean EOF is not truncation: the worker said everything it had to say.
+    #[test]
+    fn a_clean_end_of_stream_is_not_marked_truncated() {
+        let input = serde_json::json!({
+            "type": "turn_end",
+            "message": {"content": [{"type": "text", "text": "the whole answer"}]}
+        })
+        .to_string()
+            + "\n";
+        let (rx, handle) = spawn_event_reader_signalled(std::io::Cursor::new(input), |_| {});
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reader must finish");
+        handle.join().unwrap();
+        assert!(
+            outcome.truncated.is_none(),
+            "a clean finish was marked truncated: {:?}",
+            outcome.truncated
+        );
+        assert!(!outcome.reply.contains("INCOMPLETE"));
     }
 
     /// 否定词不能太短，否则会吃掉正常问句。
@@ -2041,7 +2168,9 @@ mod tests {
         let (summary, path) = spill_output(long.clone(), "T1", "node-a");
         let path = path.expect("long output must spill");
         assert!(path.contains("node-output"), "path was {path}");
-        assert!(path.ends_with("/T1/node-a.txt"), "path was {path}");
+        // A run-unique suffix: two sessions must not compute the same file.
+        assert!(path.contains("/T1/node-a-"), "path was {path}");
+        assert!(path.ends_with(".txt"), "path was {path}");
 
         // The file holds the full text, byte for byte.
         let written = std::fs::read_to_string(&path).expect("spill file exists");
@@ -2053,6 +2182,25 @@ mod tests {
         assert!(summary.contains(&path));
         assert!(summary.len() < long.len());
         let _ = std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap().parent().unwrap());
+    }
+
+    /// Two sessions that both named their task `T1` must not overwrite each
+    /// other's spill file.
+    ///
+    /// Spill holds the *complete* output when the summary is truncated, so an
+    /// overwritten spill means the cut half of that node's result is unreadable
+    /// forever — and nothing in the report says so.
+    #[test]
+    fn two_spills_for_the_same_task_and_node_do_not_collide() {
+        let long = "x".repeat(MAX_OUTPUT_BYTES + 1024);
+        let (_, first) = spill_output(long.clone(), "T1", "n1");
+        let (_, second) = spill_output(long, "T1", "n1");
+        let (first, second) = (first.unwrap(), second.unwrap());
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&first).parent().unwrap().parent().unwrap());
+        assert_ne!(
+            first, second,
+            "the same task/node computed one path, so the second spill destroys the first"
+        );
     }
 
     #[cfg(unix)]
