@@ -418,7 +418,7 @@ impl Effects {
             let rows = self.rows.lock().unwrap_or_else(|error| error.into_inner());
             rows.iter()
                 .find(|row| {
-                    row.effect.kind() == effect.kind() && row.effect.row_key() == effect.row_key()
+                    row.effect.kind() == effect.kind() && row.key() == effect.row_key()
                 })
                 .map(|row| {
                     let wait = row.due.saturating_duration_since(Instant::now());
@@ -526,7 +526,7 @@ impl Effects {
             let found = rows
                 .iter()
                 .find(|row| row.effect.kind() == kind && row.effect.key() == task_id)
-                .map(|row| (row.seq, row.effect.row_key()));
+                .map(|row| (row.seq, row.key()));
             rows.retain(|row| !(row.effect.kind() == kind && row.effect.key() == task_id));
             found
         };
@@ -628,9 +628,17 @@ impl Effects {
             let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
             // `key` is the row key (a launch's carries its wave), which is what
             // `dispatch` passed in.
-            let Some(index) = rows.iter().position(|row| {
-                row.effect.kind() == kind && row.effect.row_key() == key && row.seq == seq
-            }) else {
+            // Matched on `row.key()`, the same accessor `dispatch` took the key
+            // from. Comparing against a recomputed `row.effect.row_key()` was the
+            // reason a finished row never left the queue: the recomputation loses
+            // the session (a row rebuilt from the log payload carries
+            // `session: None`), so it produced a bare `T1#0` while `key` was
+            // `sess/T1#0`. No row matched, `settle` returned early, the row stayed
+            // queued, and the effect ran again on every tick — forever.
+            let Some(index) = rows
+                .iter()
+                .position(|row| row.effect.kind() == kind && row.key() == key && row.seq == seq)
+            else {
                 // The row was cancelled while it ran, or replaced. Its result is
                 // for a payload that is no longer queued, so drop it.
                 return;

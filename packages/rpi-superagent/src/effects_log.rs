@@ -516,14 +516,28 @@ impl Log {
                 let line = Line {
                     v: VERSION,
                     kind: kind_name(row.effect.kind()).to_string(),
-                    key: row.effect.key().to_string(),
+                    // `row.key()`, not `effect.key()`: the latter drops the
+                    // session prefix *and* the wave number, so the rewritten line
+                    // no longer matches the `done` line written for it. The row
+                    // then comes back on the next load and runs again — every
+                    // tick, forever, each run writing a `done` line that retires
+                    // nothing.
+                    key: row.key(),
                     state: State::Queued,
                     seq: row.seq,
                     attempts: row.attempts,
                     due_at: now_ms() + row.due.saturating_duration_since(std::time::Instant::now()).as_millis() as u64,
                     payload: Some(Stored::from_effect(&row.effect)),
                     error: row.error.clone(),
-                    session: None,
+                    // The session that queued this row.
+                    //
+                    // Dropping it here was the other half of the resurrection bug:
+                    // `row_key()` is namespaced by session, so a rewritten row with
+                    // `session: null` computes a bare key on the next load. Its
+                    // `done` line then matches nothing and the effect runs again —
+                    // and the compaction that caused it repeats on every write, so
+                    // the row is resurrected indefinitely.
+                    session: session_of_effect(&row.effect),
                 };
                 let mut text = serde_json::to_string(&line).map_err(std::io::Error::other)?;
                 text.push('\n');
@@ -564,6 +578,16 @@ pub fn state_after(outcome: &Result<(), Outcome>) -> State {
     match outcome {
         Ok(()) => State::Done,
         Err(_) => State::Queued,
+    }
+}
+
+/// The session that queued `effect`, for the log's `session` field.
+fn session_of_effect(effect: &Effect) -> Option<String> {
+    match effect {
+        Effect::Launch { session, .. } | Effect::Extend { session, .. } => session.clone(),
+        // A relay goes back to the session its task belongs to, which the row
+        // cannot know; it is keyed without a session either way.
+        Effect::Relay { .. } => None,
     }
 }
 

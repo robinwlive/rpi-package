@@ -381,15 +381,30 @@ rpi_plugin_sdk::export_plugin!(|api| {
     // wave again — the two collide on the worker's session file. A long-lived host
     // and the daemon do not collide: the daemon waits for a row to look abandoned
     // before it adopts it.
-    if !crate::host::host_exits_after_this_turn() {
+    //
+    // **A worker is never a scheduler.** A worker is a child `rpi` that loads this
+    // same plugin, and it shares the project's effects log with its parent. Left
+    // to start a scheduler of its own, it would read the very row that spawned it,
+    // find it still queued, run it, and spawn another worker — which would do the
+    // same. The observed result was a chain of ~90 nested processes all running
+    // one node, each writing its own `done` line, with the row never retiring.
+    //
+    // `RPI_SUPERAGENT_SUBAGENT` is the marker the spawn site already sets, and it
+    // already suppresses the orchestration guidance. It has to suppress the
+    // scheduler too: work belongs to whoever asked for it, never to the worker
+    // doing it.
+    let is_worker = std::env::var(crate::spawn::SUBAGENT_ENV).is_ok();
+    if !is_worker && !crate::host::host_exits_after_this_turn() {
         let _ = PASSES.set(Mutex::new(passes::Passes::start(
             effects().clone(),
             effects_handler::run,
         )));
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        let _ = passes_daemon::create_root(&passes_daemon::effects_dir(&cwd));
-        passes_daemon::start_daemon(&cwd);
+    if !is_worker {
+        if let Ok(cwd) = std::env::current_dir() {
+            let _ = passes_daemon::create_root(&passes_daemon::effects_dir(&cwd));
+            passes_daemon::start_daemon(&cwd);
+        }
     }
 
 
